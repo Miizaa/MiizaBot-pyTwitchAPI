@@ -1,0 +1,11 @@
+.vscode/
+logs/
+__pycache__/
+bot-bckp.py
+config.json
+icon.py
+logo.ico
+robo.png
+*.spec
+*.exe
+build/
