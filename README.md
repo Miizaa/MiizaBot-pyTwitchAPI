@@ -10,12 +10,11 @@ Um bot de Twitch **portátil** e com **Interface Gráfica (GUI)**, focado em mod
 
 ### 🛡️ Moderação & Segurança
 * **Comandos de Moderação:** `!ban`, `!timeout`, `!unban` e `!limpar` com logs automáticos.
-* **Histórico de Moderação:** Salva todas as ações (quem baniu quem e por qual motivo) em arquivo de texto (`logs/moderation_history.txt`).
+* **Histórico de Moderação:** Salva todas as ações (quem baniu quem e por qual motivo, mas, apenas as ações via comando do bot.) em arquivo de texto (`logs/moderation_history.txt`).
 * **Log de Chat Colorido:** Interface visual que destaca mensagens, subs e alertas do sistema.
 
 ### 💬 Interação & Chat
 * **Sistema de Saudações Inteligente:** Agrupa variações de "Oi" (ex: *olá, eai, opa*) para responder com um cooldown compartilhado, evitando spam.
-* **Comandos Customizados:** Criação fácil de comandos de texto via Interface.
 * **Multi-Canal:** Pode conectar e monitorar múltiplos canais simultaneamente.
 
 ### ⚙️ Sistema & Usabilidade
