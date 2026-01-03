@@ -2,19 +2,18 @@
 
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue?style=for-the-badge&logo=python&logoColor=white)
 ![Twitch API](https://img.shields.io/badge/Twitch_API-EventSub-purple?style=for-the-badge&logo=twitch&logoColor=white)
-![Status](https://img.shields.io/badge/Status-Stable-green?style=for-the-badge)
+![Status](https://img.shields.io/badge/Status-Test-green?style=for-the-badge)
 
 Um bot de Twitch **portátil** e com **Interface Gráfica (GUI)**, focado em moderação manual, logs de eventos e interação inteligente com espectadores. Desenvolvido para rodar localmente no Windows sem necessidade de servidores complexos.
 
 ## ✨ Funcionalidades
 
 ### 🛡️ Moderação & Segurança
-* **Comandos de Moderação:** `!ban`, `!timeout`, `!unban` e `!limpar` com logs automáticos.
-* **Histórico de Moderação:** Salva todas as ações (quem baniu quem e por qual motivo, mas, apenas as ações via comando do bot.) em arquivo de texto (`logs/moderation_history.txt`).
+* **Ações de moderação:** `!ban`, `!timeout`, `!unban` e `!limpar`, além de botões na interface.
 * **Log de Chat Colorido:** Interface visual que destaca mensagens, subs e alertas do sistema.
 
 ### 💬 Interação & Chat
-* **Sistema de Saudações Inteligente:** Agrupa variações de "Oi" (ex: *olá, eai, opa*) para responder com um cooldown compartilhado, evitando spam.
+* **Sistema de Saudações Inteligente:** Agrupa variações de "Oi" (ex: *olá, eai, opa*) para responder com um cooldown, evitando spam.
 * **Multi-Canal:** Pode conectar e monitorar múltiplos canais simultaneamente.
 
 ### ⚙️ Sistema & Usabilidade
@@ -34,13 +33,13 @@ Um bot de Twitch **portátil** e com **Interface Gráfica (GUI)**, focado em mod
 
 1.  Clone este repositório:
     ```bash
-    git clone [https://github.com/SEU_USUARIO/MiizaBot.git](https://github.com/SEU_USUARIO/MiizaBot.git)
+    git clone https://github.com/Miizaa/MiizaBot.git
     cd MiizaBot
     ```
 
 2.  Instale as dependências:
     ```bash
-    pip install twitchAPI pywin32 winshell
+    pip install PySide6 twitchAPI qasync winshell pywin32
     ```
     *(Nota: Se usar ambiente virtual, ative-o antes)*
 
@@ -49,7 +48,16 @@ Um bot de Twitch **portátil** e com **Interface Gráfica (GUI)**, focado em mod
     python bot.py
     ```
 
-4.  Na primeira execução, o **Assistente de Configuração** abrirá. Insira seu `Client ID`, `Client Secret` e nome do bot.
+4.  Na primeira execução, clique no botão ⚙️ (Configurações).
+
+    Insira o Nome do Bot, Client ID e Client Secret.
+
+    Digite o nome do canal (ou canais separados por vírgula) na barra superior.
+
+    Clique em CONECTAR.
+
+    O Token de Acesso será gerado automaticamente na primeira conexão (uma janela do navegador abrirá para autorizar).
+
 
 ---
 
@@ -62,7 +70,7 @@ Se você deseja criar um executável para rodar em computadores sem Python insta
     pip install pyinstaller
     ```
 
-2.  Execute o comando de build (certifique-se de ter o arquivo `logo.ico` na pasta):
+2.  Execute o comando de build:
     ```bash
     python -m PyInstaller --noconfirm --onefile --windowed --name "MiizaBot" --collect-all twitchAPI --hidden-import="winshell" --hidden-import="win32com" --clean bot.py
     ```
@@ -79,7 +87,9 @@ Se você deseja criar um executável para rodar em computadores sem Python insta
 | `!timeout <user> <seg> <motivo>` | Mod/Streamer | Aplica silêncio temporário. | `!timeout @user 600 Calma` |
 | `!unban <user>` | Mod/Streamer | Remove o banimento. | `!unban @user` |
 | `!limpar` | Mod/Streamer | Apaga o histórico recente do chat. | `!limpar` |
-| `!comando` | Todos | Comandos customizados criados na config. | `!discord` |
+| `!addcmd` | Mod/Streamer | Cria um comando customizado. | `!addcmd <nome> <cooldown> <global/user> <resposta>` |
+| `!delcmd` | Mod/Streamer | Apaga um comando customizado. | `!delcmd !discord` |
+
 
 ---
 
@@ -89,9 +99,8 @@ O bot cria e gerencia os seguintes arquivos automaticamente:
 
 * `config.json`: Armazena tokens e configurações (Não compartilhe este arquivo!).
 * `logs/`: Pasta contendo:
-    * `moderation_history.txt`: Log perpétuo de bans/timeouts.
     * `subscription_history.txt`: Histórico de inscritos.
-    * `YYYY-MM/`: Pastas mensais com logs diários de todo o chat.
+    * `YYYY-MM-DD`: Pastas com logs diários dos canais conectados.
 
 ---
 

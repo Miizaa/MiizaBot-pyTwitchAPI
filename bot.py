@@ -1,36 +1,54 @@
-import ctypes
-import asyncio
-import tkinter as tk
-import tkinter.ttk as ttk
-from tkinter import scrolledtext, messagebox, simpledialog
-import json
-import datetime
 import sys
 import os
-import signal
+import json
+import datetime
+import asyncio
 import time
 import random
-import webbrowser
 import winshell
+import http.client
 from win32com.client import Dispatch
+
+# --- IMPORTAÇÕES DA INTERFACE GRÁFICA (PySide6) ---
+# Usamos PySide6 para criar janelas, botões e a interface visual moderna.
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                               QHBoxLayout, QLineEdit, QPushButton, QTextEdit,
+                               QTextBrowser, QLabel, QDialog, QTabWidget, QFormLayout,
+                               QCheckBox, QSpinBox, QListWidget, QMessageBox,
+                               QFrame, QSplitter, QComboBox, QInputDialog)
+from PySide6.QtCore import Qt, Signal, QObject, Slot, QSize, QUrl
+from PySide6.QtGui import QIcon, QFont, QColor, QPalette, QDesktopServices
+
+# --- IMPORTAÇÕES DA TWITCH API ---
+# Biblioteca para conectar e interagir com a Twitch.
+from twitchAPI import helper
+# Helper para corrigir problemas de async generator em versões específicas do Python/Lib
+async def fixed_first(generator):
+    items = [i async for i in generator]
+    return items[0] if items else None
+helper.first = fixed_first
+
 from twitchAPI.twitch import Twitch
 from twitchAPI.oauth import UserAuthenticator
 from twitchAPI.chat import Chat, ChatMessage, ChatEvent
 from twitchAPI.type import AuthScope
+import qasync # Integra o loop do asyncio (Python) com o loop de eventos do Qt (Interface)
 
-def resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
+# --- CONFIGURAÇÃO DE CAMINHOS E ARQUIVOS ---
+# Verifica se está rodando como executável (congelado) ou script Python normal
+if getattr(sys, 'frozen', False):
+    # Se for .exe, a pasta base é onde o executável está
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    # Se for script, a pasta base é onde o arquivo .py está
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-    return os.path.join(base_path, relative_path)
-
-CONFIG_FILE = 'config.json'
-PASTA_LOGS = 'logs'
-MOD_LOG_FILE = os.path.join(PASTA_LOGS, 'moderation_history.txt')
+CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
+PASTA_LOGS = os.path.join(BASE_DIR, 'logs')
 SUB_LOG_FILE = os.path.join(PASTA_LOGS, 'subscription_history.txt')
 
+# --- PERMISSÕES (SCOPES) ---
+# Define o que o bot pode fazer na conta do usuário (ler chat, moderar, banir, etc).
 SCOPES = [
     AuthScope.CHANNEL_MODERATE,
     AuthScope.CHAT_EDIT,
@@ -40,23 +58,41 @@ SCOPES = [
     AuthScope.MODERATOR_MANAGE_CHAT_MESSAGES
 ]
 
-def carregar_config_inicial():
+# Função para encontrar recursos (ícones, etc) tanto no script quanto no .exe
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+# --- GERENCIAMENTO DE CONFIGURAÇÃO ---
+# Carrega o arquivo JSON ou cria um padrão se não existir.
+def carregar_config():
     default_config = {
         "APP_ID": "",
         "APP_SECRET": "",
         "ACCESS_TOKEN": "",
         "REFRESH_TOKEN": "",
-        "NOME_DO_BOT": "miiza",
-        "CANAIS": "miiza",
-        "PALAVRAS_ALERTA": ["miiza"],
+        "NOME_DO_BOT": "",
+        "CANAIS": "",
+        "PALAVRAS_ALERTA": [""],
         "COMANDOS_CUSTOM": {},
         "COOLDOWN_PADRAO": 10,
         "ATRASO_RESPOSTA_MIN": 2,
         "ATRASO_RESPOSTA_MAX": 5,
-        "SAUDACOES": {"bom dia": {"respostas": ["Bom dia!"], "cooldown": 60}}
+        "SAUDACOES": {
+            "bom dia": {
+                "respostas": ["Bom dia!"],
+                "cooldown": 60,
+                "gatilhos": ["bom dia"]}},
+        "INICIAR_COM_WINDOWS": False
     }
+    
+    # Cria a pasta de logs se não existir
     if not os.path.exists(PASTA_LOGS):
         os.makedirs(PASTA_LOGS)
+
     if not os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(default_config, f, indent=4)
@@ -64,873 +100,1291 @@ def carregar_config_inicial():
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             cfg = json.load(f)
+            # Mescla com padrão para garantir que chaves novas existam
             for k, v in default_config.items():
                 if k not in cfg:
                     cfg[k] = v
             return cfg
-    except:
-        return None
+    except Exception:
+        return default_config
 
 def salvar_config(config):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4)
 
-def registrar_moderacao(acao, canal, alvo, admin, motivo=""):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = f"[{timestamp}] AÇÃO: {acao} | CANAL: #{canal} | ALVO: {alvo} | POR: {admin} | MOTIVO: {motivo}\n"
-
-    with open(MOD_LOG_FILE, 'a', encoding='utf-8') as f:
-        f.write(log_entry)
-
-def registrar_chat(canal, usuario, mensagem):
-    agora = datetime.datetime.now()
-    pasta_dia = os.path.join(PASTA_LOGS, agora.strftime("%Y-%m"))
-    if not os.path.exists(pasta_dia):
-        os.makedirs(pasta_dia)
-
-    nome_arquivo = f"chat_{canal}_{agora.strftime('%Y-%m-%d')}.txt"
-    caminho = os.path.join(pasta_dia, nome_arquivo)
-
-    timestamp = agora.strftime("%H:%M:%S")
-    linha = f"[{timestamp}] {usuario}: {mensagem}\n"
-
-    with open(caminho, 'a', encoding='utf-8') as f:
-        f.write(linha)
-
+# --- LOGGING DE ARQUIVOS ---
+# Salva histórico de Subs em arquivo de texto.
 def registrar_inscricao(canal, usuario, tier, meses, mensagem=""):
-    if not os.path.exists(PASTA_LOGS):
-        os.makedirs(PASTA_LOGS)
+    try:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        info = f"[{timestamp}] CANAL: {canal} SUB: {usuario} | TIER: {tier} | MESES: {meses} | MSG: {mensagem}\n"
+        
+        if not os.path.exists(PASTA_LOGS):
+            os.makedirs(PASTA_LOGS)
+            
+        with open(SUB_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(info)
+    except Exception as e:
+        print(f"Erro ao salvar sub: {e}")
 
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    info = f"[{timestamp}]CANAL: {canal} SUB: {usuario} | TIER: {tier} | MESES: {meses} | MSG: {mensagem}\n"
-
-    with open(SUB_LOG_FILE, 'a', encoding='utf-8') as f:
-        f.write(info)
-
-def abrir_pasta_logs(self):
-    if os.path.exists(PASTA_LOGS):
-        os.startfile(os.path.abspath(PASTA_LOGS))
-    else:
-        messagebox.showwarning(
-            "Aviso", "A pasta de logs ainda não foi criada.")
-
-def assistente_configuracao():
-    if os.path.exists("config.json"):
-        return True
-
-    setup = tk.Tk()
-    setup.title("Configuração Inicial MiizaBot")
-    setup.geometry("400x450")
-    setup.configure(bg="#1e1e1e")
-
-    style = {"bg": "#1e1e1e", "fg": "white", "font": ("Arial", 9, "bold")}
-
-    tk.Label(setup, text="BEM-VINDO AO BOT DO MIIZA", font=("Arial",
-             12, "bold"), bg="#1e1e1e", fg="#6441a5").pack(pady=15)
-
-    inputs = {}
-    campos = [
-        ("NOME_DO_BOT", "Nome do Usuário do Bot:"),
-        ("CANAIS", "Canais para monitorar (separados por vírgula):"),
-        ("APP_ID", "Client ID (dev.twitch.tv/console):"),
-        ("APP_SECRET", "Client Secret (dev.twitch.tv/console):")
-    ]
-
-    for chave, label in campos:
-        tk.Label(setup, text=label, **style).pack(padx=20, anchor="w")
-        ent = tk.Entry(setup, width=40, bg="#3d3d3d",
-                       fg="white", insertbackground="white")
-        ent.pack(pady=5, padx=20)
-        inputs[chave] = ent
-
-    def salvar_setup():
-        novo_config = {
-            "NOME_DO_BOT": inputs["NOME_DO_BOT"].get().strip(),
-            "CANAIS": inputs["CANAIS"].get().strip(),
-            "APP_ID": inputs["APP_ID"].get().strip(),
-            "APP_SECRET": inputs["APP_SECRET"].get().strip(),
-            "PALAVRAS_ALERTA": ["admin", "staff", "ajuda"],
-            "ATRASO_RESPOSTA_MIN": 2,
-            "ATRASO_RESPOSTA_MAX": 5
-        }
-
-        if not all([novo_config["NOME_DO_BOT"], novo_config["APP_ID"], novo_config["APP_SECRET"]]):
-            messagebox.showerror(
-                "Erro", "Por favor, preencha todos os campos obrigatórios!")
-            return
-
-        with open("config.json", "w", encoding='utf-8') as f:
-            json.dump(novo_config, f, indent=4)
-
-        setup.destroy()
-
-    tk.Button(setup, text="FINALIZAR E ABRIR BOT", command=salvar_setup,
-              bg="#6441a5", fg="white", font=("Arial", 10, "bold"), pady=10).pack(pady=20)
-
-    setup.mainloop()
-    return True
-
+# Cria atalho no Windows para iniciar com o sistema
 def configurar_inicializacao_windows(ativar):
     startup_path = winshell.startup()
     shortcut_path = os.path.join(startup_path, "MiizaBot.lnk")
-    exe_path = sys.executable
-
+    
     if ativar:
         if not os.path.exists(shortcut_path):
-            shell = Dispatch('WScript.Shell')
-            shortcut = shell.CreateShortCut(shortcut_path)
-            shortcut.Targetpath = exe_path
-            shortcut.WorkingDirectory = os.path.dirname(exe_path)
-            shortcut.IconLocation = exe_path
-            shortcut.save()
-    else:
-        if os.path.exists(shortcut_path):
-            os.remove(shortcut_path)
+            shortcutpath(shortcut_path)
+    elif os.path.exists(shortcut_path):
+        os.remove(shortcut_path)
 
-class TwitchChatHandler:
-    def __init__(self, gui_app):
-        self.gui = gui_app
+def shortcutpath(shortcut_path):
+    exe_path = sys.executable
+    shell = Dispatch('WScript.Shell')
+    shortcut = shell.CreateShortCut(shortcut_path)
+    shortcut.Targetpath = exe_path
+    shortcut.WorkingDirectory = os.path.dirname(exe_path)
+    shortcut.IconLocation = exe_path
+    shortcut.save()
+
+# --- COMPONENTE DE LOG CUSTOMIZADO ---
+# Subclasse de QTextBrowser para impedir que cliques em links naveguem para outra página.
+# Isso evita que o log seja limpo ao clicar nos botões de moderação.
+class LogBrowser(QTextBrowser):
+    def setSource(self, name: QUrl):
+        pass # Não faz nada, bloqueando a navegação padrão
+
+# --- SINAIS DO BOT (COMUNICAÇÃO THREAD -> GUI) ---
+# O Bot roda em uma thread separada da interface. Usamos sinais para atualizar a tela.
+class BotSignals(QObject):
+    log = Signal(str, str, str) # Mensagem, Tipo, Canal
+    chat_message = Signal(dict) # Dados estruturados da mensagem de chat
+    status = Signal(str)        # Status da conexão (ONLINE, OFFLINE)
+    counter = Signal(int)       # Contador de mensagens
+    stats_update = Signal(str, int) # Atualiza contadores de Subs
+    pop_alert = Signal(str, str)    # Mostra popups de alerta
+
+# --- LÓGICA PRINCIPAL DO BOT ---
+class TwitchBotLogic:
+    def __init__(self, signals: BotSignals):
+        self.signals = signals
         self.twitch = None
         self.chat = None
         self.bot_user_id = None
         self.is_connected = False
+        self.should_be_connected = False
         self.total_mensagens = 0
         self.last_command_usage = {}
+        self.canais_conectados = set()
         self.stats = {"bans": 0, "timeouts": 0, "subs": 0}
+        self.user_id_cache = {} # Cache para evitar buscar IDs na API repetidamente
 
-    async def connect(self, channels_list):
-        cfg = carregar_config_inicial()
+    # Busca o ID numérico de um usuário/canal (necessário para banir/deletar)
+    async def get_user_id(self, username):
+        username = username.strip().lower()
+        if username in self.user_id_cache:
+            return self.user_id_cache[username]
+        
         try:
-            self.gui.log_message("1. Inicializando API Twitch...", "sistema")
+            users_gen = self.twitch.get_users(logins=[username])
+            user = await helper.first(users_gen)
+            if user:
+                self.user_id_cache[username] = user.id
+                return user.id
+        except Exception as e:
+            print(f"Erro ao buscar ID de {username}: {e}")
+        return None
+
+    # Conecta à Twitch, autentica e entra nos canais
+    async def connect(self, channels_list):
+        self.should_be_connected = True
+        cfg = carregar_config()
+        try:
+            self.signals.log.emit("Inicializando API Twitch...", "sistema", "")
             self.twitch = await Twitch(cfg["APP_ID"], cfg["APP_SECRET"])
 
+            # Autenticação OAuth
             token = cfg.get("ACCESS_TOKEN")
             refresh = cfg.get("REFRESH_TOKEN")
             target_scopes = SCOPES
-
-            auth = UserAuthenticator(self.twitch, target_scopes, force_verify=False)
             
+            auth = UserAuthenticator(self.twitch, target_scopes, force_verify=False)
             if not token or not refresh:
                 token, refresh = await auth.authenticate()
             else:
                 try:
                     await self.twitch.set_user_authentication(token, target_scopes, refresh)
-                except:
-                    self.gui.log_message("Token expirado, renovando...", "erro")
+                except Exception:
+                    self.signals.log.emit("Token expirado, renovando...", "erro", "")
                     token, refresh = await auth.authenticate()
 
             await self.twitch.set_user_authentication(token, target_scopes, refresh)
-            
             cfg["ACCESS_TOKEN"] = token
             cfg["REFRESH_TOKEN"] = refresh
             salvar_config(cfg)
 
-            user_auth_scope = self.twitch.get_user_auth_scope()
-            if AuthScope.CHANNEL_MODERATE in user_auth_scope:
-                self.gui.log_message("✅ Permissão CHANNEL_MODERATE: OK", "sistema")
-            else:
-                self.gui.log_message("❌ FALTANDO PERMISSÃO DE MODERADOR!", "erro")
+            # Pega informações do próprio bot
+            if users_list := [u async for u in self.twitch.get_users()]:
+                user_info = users_list[0]
+                self.bot_user_id = user_info.id
+                self.user_id_cache[user_info.login.lower()] = user_info.id
+                self.signals.log.emit(f"🔑 Logado como: {user_info.login.upper()}", "sistema", "")
 
-            user_info = await anext(self.twitch.get_users())
-            login_token = user_info.login
-            self.bot_user_id = user_info.id
-            self.gui.log_message(f"🔑 BOT LOGADO COMO: {login_token.upper()}", "sistema")
-
-
+            # Inicializa o Chat
             self.chat = await Chat(self.twitch)
+            
+            # Registra eventos (Mensagens, Subs, Conexão Pronta)
             self.chat.register_event(ChatEvent.MESSAGE, self.on_message)
             self.chat.register_event(ChatEvent.SUB, self.on_sub)
+            self.chat.register_event(ChatEvent.READY, self.on_ready)
+            
             self.chat.start()
             
             await asyncio.sleep(1)
 
+            # Entra nos canais listados
             self.canais_conectados = set()
             for canal in channels_list:
                 c_nome = canal.strip().lower()
                 if not c_nome: continue
-                
                 try:
                     await self.chat.join_room(c_nome)
                     self.canais_conectados.add(c_nome)
-                    self.gui.log_message(f"💬 Conectado ao chat de #{c_nome}", "sistema")
-                    
-
+                    self.signals.log.emit(f"💬 Entrou no canal #{c_nome}", "sistema", "")
+                    asyncio.create_task(self.get_user_id(c_nome))
                 except Exception as e:
-                    self.gui.log_message(f"Erro ao conectar em #{c_nome}: {e}", "erro")
-
+                    self.signals.log.emit(f"Erro ao entrar em #{c_nome}: {e}", "erro", "")
+            
+            # Inicia tarefas de fundo
+            asyncio.create_task(self.monitorar_conexao())
+            asyncio.create_task(self.agendar_virada_ano())
             self.is_connected = True
-            self.gui.update_status("ONLINE")
 
         except Exception as e:
-            self.gui.log_message(f"ERRO CRÍTICO: {str(e)}", "erro")
-            import traceback
-            traceback.print_exc()
+            self.signals.log.emit(f"ERRO CRÍTICO NA CONEXÃO: {str(e)}", "erro", "")
+            self.signals.status.emit("ERRO")
+            self.is_connected = False
+            
+    async def on_ready(self, event):
+        self.is_connected = True 
+        self.signals.status.emit("ONLINE")
+        self.signals.log.emit("🟢 Conexão com o Chat estabelecida!", "sistema", "")
+    
+    # Tarefa que espera o Ano Novo para mandar mensagem
+    async def agendar_virada_ano(self):
+        try:
+            while self.should_be_connected:
+                agora = datetime.datetime.now()
+                ano_que_vem = agora.year + 1
+                data_alvo = datetime.datetime(ano_que_vem, 1, 1, 0, 0, 0)
+                self.signals.log.emit(f"📅 Alvo do Ano Novo: {data_alvo}", "sistema", "")
+                
+                # Loop de espera fracionada para evitar overflow do timer
+                while True:
+                    if not self.should_be_connected: return
+                    agora = datetime.datetime.now()
+                    delta = (data_alvo - agora).total_seconds()
+                    if delta <= 0:
+                        break # Chegou a hora!
+                    
+                    # Dorme no máximo 1 hora por vez
+                    tempo_sono = min(delta, 3600)
+                    await asyncio.sleep(tempo_sono)
+                
+                # Envia mensagem festiva
+                if self.is_connected and self.chat:
+                    mensagem_festiva = f"🎆 FELIZ ANO NOVO DE {ano_que_vem}! 🎆 Que seja um ano incrível para todos nós! 🥂✨"
+                    for canal in self.canais_conectados:
+                        try:
+                            await self.chat.send_message(canal, mensagem_festiva)
+                            await asyncio.sleep(0.5) # Delay anti-spam
+                        except Exception as e:
+                            print(f"Erro envio ano novo {canal}: {e}")
+                    self.signals.log.emit("🎉 Mensagens de Ano Novo enviadas!", "evento", "")
+                await asyncio.sleep(60) 
+        except Exception as e:
+            print(f"Erro no agendamento de Ano Novo: {e}")
+        
+    # Monitora se a internet ou a conexão com a Twitch caiu e tenta reconectar
+    async def monitorar_conexao(self):
+        print(">>> MONITOR: Iniciado com sucesso.")
+        while self.should_be_connected:
+            try:
+                lib_conectada = self.chat is not None and self.chat.is_connected()
+                try:
+                    # Verifica internet real pingando o Google
+                    internet_ok = await asyncio.wait_for(
+                        asyncio.to_thread(self.checar_internet_real), 
+                        timeout=3.0
+                    )
+                except asyncio.TimeoutError:
+                    print(">>> MONITOR: Timeout! Internet lenta ou caída.")
+                    internet_ok = False
+                except Exception:
+                    internet_ok = False
+                
+                if lib_conectada and internet_ok:
+                    if not self.is_connected:
+                        self.is_connected = True
+                        self.signals.status.emit("ONLINE")
+                        self.signals.log.emit("🟢 Conexão restabelecida.", "sistema", "")
+                elif self.is_connected:
+                    self.is_connected = False
+                    msg = "⚠️ Queda na Twitch" if internet_ok else "⚠️ Internet caiu!"
+                    self.signals.status.emit("RECONECTANDO...")
+                    self.signals.log.emit(msg, "erro", "")
 
+            except Exception as e:
+                print(f">>> MONITOR ERRO: {e}")
+            await asyncio.sleep(3)
 
+    def checar_internet_real(self):
+        try:
+            conn = http.client.HTTPConnection("www.google.com", timeout=3)
+            conn.request("HEAD", "/")
+            conn.close()
+            return True
+        except Exception:
+            return False
+
+    # Permite adicionar/remover canais sem reiniciar o bot
     async def atualizar_canais_dinamico(self, nova_lista_str):
-        if not self.is_connected or self.chat is None:
-            return
-        novos_canais = {c.strip().lower()
-                        for c in nova_lista_str.split(',') if c.strip()}
+        if not self.is_connected or self.chat is None: return
+        novos_canais = {c.strip().lower() for c in nova_lista_str.split(',') if c.strip()}
+        
         para_entrar = novos_canais - self.canais_conectados
         for c in para_entrar:
-            await self.chat.join_room(c)
-            self.canais_conectados.add(c)
-            self.gui.after(0, lambda ch=c: self.gui.log_message(
-                f"-> Entrou em #{ch}", "sistema"))
+            try:
+                await self.chat.join_room(c)
+                self.canais_conectados.add(c)
+                self.signals.log.emit(f"➡️ Entrou em #{c}", "sistema", "")
+                asyncio.create_task(self.get_user_id(c))
+            except Exception as e:
+                self.signals.log.emit(f"Erro ao entrar em #{c}: {e}", "erro", "")
+        
         para_sair = self.canais_conectados - novos_canais
         for c in para_sair:
-            await self.chat.leave_room(c)
-            self.canais_conectados.remove(c)
-            self.gui.after(0, lambda ch=c: self.gui.log_message(
-                f"<- Saiu de #{ch}", "sistema"))
+            try:
+                await self.chat.leave_room(c)
+                self.canais_conectados.remove(c)
+                self.signals.log.emit(f"⬅️ Saiu de #{c}", "sistema", "")
+            except Exception as e:
+                self.signals.log.emit(f"Erro ao sair de #{c}: {e}", "erro", "")
+                
+        cfg = carregar_config()
+        cfg["CANAIS"] = nova_lista_str
+        salvar_config(cfg)
+        self.signals.log.emit("Lista de canais atualizada.", "sistema", "")
 
+    async def close(self):
+        self.should_be_connected = False 
+        if not self.chat: return
+        self.signals.status.emit("Desconectando...")
+        self.chat.stop()
+        if self.twitch: await self.twitch.close()
+        self.is_connected = False
+        self.signals.status.emit("OFFLINE")
+        self.signals.log.emit("Bot desconectado manualmente.", "sistema", "")
+        
+    # --- MÉTODO DE INSCRIÇÕES HÍBRIDO ---
+    # Detecta Subs e Presentes analisando a mensagem do sistema,
+    # garantindo que o nome de quem pagou apareça corretamente.
     async def on_sub(self, sub):
         try:
             canal = sub.room.name
-            usuario = "Doador_Anonimo"
-            if hasattr(sub, 'system_message') and sub.system_message:
-                mensagem_limpa = sub.system_message.replace(r'\s', ' ')
-                usuario = mensagem_limpa.split(' ')[0]
-            acao_tipo = "SUB"
-            msg_sys_low = (sub.system_message or "").lower()
-            if "gifted" in msg_sys_low:
-                acao_tipo = "GIFT-SUB"
-            tier_raw = getattr(sub, 'sub_plan', '1000')
-            tier = "Prime" if tier_raw == 'Prime' else f"Tier {int(tier_raw)//1000}"
-            meses = getattr(sub, 'cumulative_months', 1)
-            msg_sub = getattr(sub, 'sub_message', "Sem mensagem")
-            registrar_inscricao(canal, usuario, tier, meses,
-                                f"[{acao_tipo}] {msg_sub}")
-            log_msg = f"✨ {usuario} -> {acao_tipo} ({tier})!"
-            self.gui.after(0, lambda: self.gui.incrementar_estatistica("subs"))
-            self.gui.after(
-                0, lambda m=log_msg: self.gui.log_message(m, "evento"))
+            
+            # 1. Pega a mensagem do sistema crua
+            system_msg = getattr(sub, 'system_message', '')
+            if system_msg:
+                system_msg = system_msg.replace(r'\s', ' ')
+            
+            # 2. Identifica o "Ator" (Quem pagou)
+            usuario = "Anônimo"
+            if system_msg:
+                usuario = system_msg.split(' ')[0]
+            elif hasattr(sub, 'chat_user') and sub.chat_user:
+                usuario = sub.chat_user.display_name
+            
+            # 3. Detecta se é Gift e tenta achar o Receptor na string
+            msg_lower = system_msg.lower()
+            is_gift = "gift" in msg_lower or "presente" in msg_lower
+            
+            receptor = None
+            if is_gift:
+                if " to " in system_msg:
+                    try:
+                        parts = system_msg.split(" to ")
+                        possible_name = parts[-1].strip()
+                        if possible_name.endswith('.'): possible_name = possible_name[:-1]
+                        receptor = possible_name
+                    except Exception:
+                        pass
+                
+                if not receptor and hasattr(sub, 'recipient') and sub.recipient:
+                    receptor = sub.recipient.display_name
+
+            tier = getattr(sub, 'sub_plan', 'Tier 1')
+            msg_usuario = getattr(sub, 'sub_message', '') 
+            
+            self.stats['subs'] += 1
+            self.signals.stats_update.emit('subs', self.stats['subs'])
+            
+            if is_gift:
+                quem_recebeu = receptor or "Alguém"
+                log_text = f"PRESENTE: De {usuario} -> Para {quem_recebeu}"
+                self.signals.log.emit(f"🎁 {usuario} presenteou {quem_recebeu} ({tier})", "evento", canal)
+                registrar_inscricao(canal, log_text, tier, 1, "Gift Sub")
+            else:
+                self.signals.log.emit(f"{canal}✨ Novo Sub: {usuario} ({tier})", "evento", canal)
+                registrar_inscricao(canal, usuario, tier, 1, msg_usuario)
+                
         except Exception as e:
-            self.gui.after(0, lambda m=str(
-                e): self.gui.log_message(f"Erro Sub: {m}", "erro"))
+            print(f"Erro ao processar sub: {e}")
+            self.signals.log.emit(f"{canal}✨ Novo Sub (Erro parser): {str(e)}", "evento", canal)
 
-    async def on_raid(self, raid):
-        registrar_moderacao("RAID RECEBIDA", raid.room.name,
-                            f"{raid.viewer_count} viewers", raid.raider.display_name)
-        self.gui.after(0, lambda: self.gui.log_message(
-            f"🚀 RAID: {raid.raider.display_name} ({raid.viewer_count})", "sistema"))
-
-    async def clear_chat_api(self, channel_name, admin_name):
+    # --- MODERAÇÃO (BAN/TIMEOUT/DELETE) ---
+    async def timeout_user(self, channel_name, target_user, duration):
+        if not self.is_connected: return
         try:
-            broadcaster_id = None
-            async for user in self.twitch.get_users(logins=[channel_name]):
-                broadcaster_id = user.id
-                break
-            if broadcaster_id:
-                await self.twitch.delete_chat_messages(broadcaster_id, self.bot_user_id)
-                registrar_moderacao("LIMPAR CHAT", channel_name,
-                                    "TODOS", admin_name, "Comando !limpar")
-                self.gui.after(0, lambda: self.gui.log_message(
-                    f"Chat de #{channel_name} limpo por {admin_name}", "moderacao"))
+            broadcaster_id = await self.get_user_id(channel_name)
+            target_id = await self.get_user_id(target_user)
+            
+            if not broadcaster_id or not target_id:
+                self.signals.log.emit(f"Erro ID: {channel_name}/{target_user}", "erro", channel_name)
+                return
+
+            await self.twitch.ban_user(
+                broadcaster_id,
+                self.bot_user_id,
+                target_id,
+                f"Timeout via MiizaBot ({duration}s)",
+                duration=duration
+            )
+            self.signals.log.emit(f"⏳ Timeout aplicado em {target_user} ({duration}s)", "moderacao", channel_name)
+        except Exception as e:
+            self.signals.log.emit(f"Falha ao dar Timeout: {e}", "erro", channel_name)
+
+    async def ban_user(self, channel_name, target_user):
+        if not self.is_connected: return
+        try:
+            broadcaster_id = await self.get_user_id(channel_name)
+            target_id = await self.get_user_id(target_user)
+            if not broadcaster_id or not target_id:
+                self.signals.log.emit(f"Erro ID: {channel_name}/{target_user}", "erro", channel_name)
+                return
+
+            await self.twitch.ban_user(broadcaster_id, self.bot_user_id, target_id, "Banido via MiizaBot")
+            self.signals.log.emit(f"🚫 Ban aplicado em {target_user}", "moderacao", channel_name)
+        except Exception as e:
+            self.signals.log.emit(f"Falha ao Banir: {e}", "erro", channel_name)
+
+    async def delete_message(self, channel_name, msg_id):
+        if not self.is_connected: return
+        try:
+            broadcaster_id = await self.get_user_id(channel_name)
+            if not broadcaster_id: return
+
+            await self.twitch.delete_chat_message(
+                broadcaster_id,
+                self.bot_user_id,
+                message_id=msg_id
+            )
+            self.signals.log.emit("🗑️ Mensagem deletada", "moderacao", channel_name)
+        except Exception as e:
+            self.signals.log.emit("Falha ao Deletar: {e}", "erro", channel_name)
+
+    # Processa comandos customizados, de moderação e saudações
+    async def processar_texto_comando(self, texto_original, canal, usuario, user_id, is_mod, responder_func, ignorar_saudacoes=True):
+        # Sub-função para adicionar comandos (!addcmd)
+        async def _handle_addcmd(cfg, texto_low, texto_original, canal_key):
+            if not (is_mod and texto_low.startswith("!addcmd")):
+                return False
+
+            partes = texto_original.split(" ", 4)
+            if len(partes) < 5:
+                await responder_func("Sintaxe: !addcmd <nome> <segundos> <global/user> <resposta>")
                 return True
-        except Exception as e:
-            return str(e)
 
-    async def get_ids(self, broadcaster_name, target_name):
-        b_id, t_id = None, None
-        async for user in self.twitch.get_users(logins=[broadcaster_name]):
-            b_id = user.id
-            break
-        async for user in self.twitch.get_users(logins=[target_name]):
-            t_id = user.id
-            break
-        return b_id, t_id
+            cmd_nome = partes[1].lower()
+            if not cmd_nome.startswith('!'):
+                cmd_nome = f"!{cmd_nome}"
 
-    async def timeout_user(self, channel_name, target_name, duration, reason, admin):
-        try:
-            b_id, t_id = await self.get_ids(channel_name, target_name)
-            if not b_id or not t_id:
-                return "Usuário não encontrado."
-            await self.twitch.ban_user(broadcaster_id=b_id, moderator_id=self.bot_user_id, user_id=t_id, reason=reason, duration=duration)
-            return True
-        except Exception as e:
-            return str(e)
-
-    async def ban_user(self, channel_name, target_name, reason, admin):
-        try:
-            b_id, t_id = await self.get_ids(channel_name, target_name)
-            if not b_id or not t_id:
-                return "Usuário não encontrado."
-            await self.twitch.ban_user(b_id, self.bot_user_id, t_id, reason)
-            return True
-        except Exception as e:
-            return str(e)
-
-    async def unban_user(self, channel_name, target_name, admin):
-        try:
-            b_id, t_id = await self.get_ids(channel_name, target_name)
-            if not b_id or not t_id:
-                return "Usuário não encontrado."
-            await self.twitch.unban_user(b_id, self.bot_user_id, t_id)
-            return True
-        except Exception as e:
-            return str(e)
-
-    async def close(self):
-        """Encerra todas as conexões de forma segura e avisa no log."""
-        if not self.is_connected:
-            return
-
-        self.gui.after(0, lambda: self.gui.log_message("🔻 Iniciando desconexão...", "sistema"))
-        self.gui.after(0, lambda: self.gui.update_status("Desconectando..."))
-
-        
-        if self.chat:
             try:
-                self.chat.stop()
-            except Exception as e:
-                print(f"Aviso ao fechar Chat: {e}")
+                cd_tempo = int(partes[2])
+                cd_tipo = partes[3].lower()
+                resposta_cmd = partes[4]
 
-        if self.twitch:
-            try:
-                await self.twitch.close()
-            except Exception as e:
-                print(f"Aviso ao fechar Twitch: {e}")
+                if cd_tipo not in ['global', 'user']:
+                    await responder_func("Cooldown deve ser 'global' ou 'user'.")
+                    return True
 
-        self.is_connected = False
-        
-        self.gui.after(0, lambda: self.gui.update_status("Desconectado"))
-        self.gui.after(0, lambda: self.gui.log_message("🔴 BOT DESCONECTADO COM SUCESSO.", "sistema"))
-        self.gui.after(0, lambda: self.gui.log_message("-" * 40, "sistema"))
+                if "COMANDOS_CUSTOM" not in cfg:
+                    cfg["COMANDOS_CUSTOM"] = {}
+                if canal_key not in cfg["COMANDOS_CUSTOM"]:
+                    cfg["COMANDOS_CUSTOM"][canal_key] = {}
+
+                cfg["COMANDOS_CUSTOM"][canal_key][cmd_nome] = {
+                    "resposta": resposta_cmd,
+                    "cooldown": cd_tempo,
+                    "tipo": cd_tipo
+                }
+                salvar_config(cfg)
+                self.signals.log.emit(
+                    f"Comando {cmd_nome} salvo em #{canal} por {usuario}",
+                    "sistema",
+                    canal
+                )
+                await responder_func(f"Comando {cmd_nome} salvo para #{canal}!")
+            except ValueError:
+                await responder_func("Tempo deve ser número inteiro.")
+            except Exception as e:
+                self.signals.log.emit(f"Erro ao salvar comando: {e}", "erro", canal)
+            return True
+
+        # Sub-função para remover comandos (!delcmd)
+        async def _handle_delcmd(cfg, texto_low, texto_original, canal_key):
+            if not (is_mod and texto_low.startswith("!delcmd")):
+                return False
+
+            partes = texto_original.split(" ")
+            if len(partes) < 2:
+                await responder_func("Sintaxe: !delcmd <nome>")
+                return True
+
+            cmd_nome = partes[1].lower()
+            if not cmd_nome.startswith('!'):
+                cmd_nome = f"!{cmd_nome}"
+
+            if "COMANDOS_CUSTOM" in cfg and canal_key in cfg["COMANDOS_CUSTOM"]:
+                if cmd_nome in cfg["COMANDOS_CUSTOM"][canal_key]:
+                    del cfg["COMANDOS_CUSTOM"][canal_key][cmd_nome]
+                    salvar_config(cfg)
+                    self.signals.log.emit(
+                        f"Comando {cmd_nome} deletado de #{canal}",
+                        "sistema",
+                        canal
+                    )
+                    await responder_func(f"Comando {cmd_nome} removido deste canal.")
+                else:
+                    await responder_func(f"Comando {cmd_nome} não existe neste canal.")
+            else:
+                await responder_func("Não há comandos customizados neste canal.")
+            return True
+
+        # Sub-função para executar comandos customizados
+        async def _handle_custom_command(cfg, texto_original, canal_key):
+            if not texto_original.startswith('!'):
+                return False
+
+            partes_msg = texto_original.split(' ')
+            comando_acionado = partes_msg[0].lower()
+
+            custom_cmds_canal = cfg.get("COMANDOS_CUSTOM", {}).get(canal_key, {})
+
+            if comando_acionado not in custom_cmds_canal:
+                return False
+
+            dados = custom_cmds_canal[comando_acionado]
+
+            if isinstance(dados, str):
+                resposta = dados
+                cooldown = 10
+                tipo_cd = "global"
+            else:
+                resposta = dados.get("resposta", "")
+                cooldown = int(dados.get("cooldown", 10))
+                tipo_cd = dados.get("tipo", "global")
+
+            chave_cd = (
+                f"{canal}_{comando_acionado}_{user_id}"
+                if tipo_cd == "user"
+                else f"{canal}_{comando_acionado}"
+            )
+
+            if time.time() - self.last_command_usage.get(chave_cd, 0) >= cooldown:
+                await responder_func(resposta)
+                self.last_command_usage[chave_cd] = time.time()
+            return True
+
+        # Sub-função para saudações automáticas (Bom dia, etc)
+        async def _handle_saudacoes(cfg, texto_low):
+            if ignorar_saudacoes:
+                return True 
+
+            saudacoes = cfg.get("SAUDACOES", {})
+            for grp_id, dados in saudacoes.items():
+                gatilhos = dados.get("gatilhos", [])
+                if not any(texto_low.startswith(g.lower()) for g in gatilhos):
+                    continue
+
+                chave_cd = f"{canal}_{usuario}_{grp_id}"
+                if time.time() - self.last_command_usage.get(chave_cd, 0) > dados.get("cooldown", 30):
+                    resp = random.choice(dados.get("respostas", ["Olá!"]))
+                    atraso = random.uniform(
+                        cfg.get("ATRASO_RESPOSTA_MIN", 2),
+                        cfg.get("ATRASO_RESPOSTA_MAX", 5)
+                    )
+                    await asyncio.sleep(atraso)
+                    await responder_func(resp.format(user=usuario))
+                    self.last_command_usage[chave_cd] = time.time()
+                    return True
+            return False
+
+        try:
+            cfg = carregar_config()
+            texto_low = texto_original.lower()
+            canal_key = canal.lower()
+
+            # Processa na ordem: Add, Del, Custom, Saudações
+            if await _handle_addcmd(cfg, texto_low, texto_original, canal_key):
+                return
+
+            if await _handle_delcmd(cfg, texto_low, texto_original, canal_key):
+                return
+
+            if await _handle_custom_command(cfg, texto_original, canal_key):
+                return
+
+            await _handle_saudacoes(cfg, texto_low)
+
+        except Exception as e:
+            print(f"Erro crítico no processamento de mensagem: {e}")
+            self.signals.log.emit(f"Erro interno no bot: {e}", "erro", canal)
 
     async def send_message(self, message, channel):
         if self.is_connected and self.chat:
             await self.chat.send_message(channel, message)
-            self.gui.after(0, lambda: self.gui.log_message(
-                f"[BOT -> #{channel}]: {message}", "proprio"))
+            self.signals.log.emit(f"[BOT -> #{channel}]: {message}", "proprio", channel)
+            async def reply_handler(resp_text):
+                await self.chat.send_message(channel, resp_text)
+                self.signals.log.emit(f"[BOT RESPOSTA]: {resp_text}", "proprio", channel)
+            await self.processar_texto_comando(message, channel, "MIIZA", "BOT_ID", True, reply_handler, ignorar_saudacoes=True)
 
     async def on_message(self, msg: ChatMessage):
+        # Ignora mensagens do próprio bot se necessário (descomente se quiser)
+        if self.bot_user_id and msg.user.id == self.bot_user_id:
+            return
+        
         self.total_mensagens += 1
-        self.gui.after(0, lambda: self.gui.update_counter(
-            self.total_mensagens))
-
-        cfg = carregar_config_inicial()
-        texto_original = msg.text.strip()
-        texto_low = texto_original.lower()
-        usuario_display = msg.user.display_name
-        usuario_nick = msg.user.name.lower()
+        self.signals.counter.emit(self.total_mensagens)
+        
+        cfg = carregar_config()
+        texto = msg.text.strip()
+        user = msg.user.display_name
         canal = msg.room.name
-
-        registrar_chat(canal, usuario_display, texto_original)
-        e_highlight = any(
-            p.lower() in texto_low for p in cfg.get("PALAVRAS_ALERTA", []))
-        self.gui.after(0, lambda: self.gui.log_chat_colorido(datetime.datetime.now(
-        ).strftime("%H:%M"), canal, usuario_display, texto_original, e_highlight))
-
-        is_mod = msg.user.mod or usuario_nick == canal
-        partes = texto_original.split(' ')
-
-        if is_mod and texto_low == '!limpar':
-            res = await self.clear_chat_api(canal, usuario_display)
-            if res is True:
-                await msg.reply("O chat foi limpo.")
-            else:
-                self.gui.log_message(f"Erro limpar: {res}", "erro")
-            return
-
-        if is_mod and texto_low.startswith('!timeout') and len(partes) >= 3:
-            alvo = partes[1].replace('@', '').lower()
-            try:
-                segundos = int(partes[2])
-                motivo = " ".join(partes[3:]) if len(partes) > 3 else "Via Bot"
-                res = await self.timeout_user(canal, alvo, segundos, motivo, usuario_display)
-                if res is True:
-                    registrar_moderacao("TIMEOUT", canal, alvo, usuario_display, motivo)
-                    self.gui.after(0, lambda: self.gui.incrementar_estatistica("timeouts"))
-                    self.gui.log_message(f"⏱️ {alvo} levou TIMEOUT de {usuario_display}", "moderacao")
-            except ValueError:
-                pass
-            return
-
-        if is_mod and texto_low.startswith('!ban') and len(partes) >= 2:
-            alvo = partes[1].replace('@', '').lower()
-            motivo = " ".join(partes[2:]) if len(partes) > 2 else "Via Bot"
-            res = await self.ban_user(canal, alvo, motivo, usuario_display)
-            if res is True:
-                registrar_moderacao("BAN", canal, alvo, usuario_display, motivo)
-                self.gui.after(0, lambda: self.gui.incrementar_estatistica("bans"))
-                self.gui.log_message(f"🔨 {alvo} foi BANIDO por {usuario_display}", "moderacao")
-            return
-
-        if is_mod and (texto_low.startswith('!desbanir') or texto_low.startswith('!unban')) and len(partes) >= 2:
-            alvo = partes[1].replace('@', '').lower()
-            res = await self.unban_user(canal, alvo, usuario_display)
-            if res is True:
-                registrar_moderacao("UNBAN", canal, alvo, usuario_display, "Desbanido via Bot")
-                self.gui.log_message(f"🕊️ {alvo} foi DESBANIDO por {usuario_display}", "moderacao")
-            return
-
-        saudacoes = cfg.get("SAUDACOES", {})
+        is_mod = msg.user.mod or msg.user.name.lower() == canal
         
-        for id_grupo, dados in saudacoes.items():
-            if not isinstance(dados, dict): continue
-            
-            lista_gatilhos = dados.get("gatilhos", [])
-            
-            ativou = False
-            for gatilho in lista_gatilhos:
-                g_low = gatilho.lower()
-                if texto_low == g_low or texto_low.startswith(g_low + " "):
-                    ativou = True
-                    break 
-            
-            if ativou:
-                cd_val = dados.get("cooldown", 30)
-                chave_cd = f"{canal}_{usuario_nick}_{id_grupo}"
-                
-                if time.time() - self.last_command_usage.get(chave_cd, 0) < cd_val:
-                    return
-
-                respostas = dados.get("respostas", [])
-                if respostas:
-                    self.last_command_usage[chave_cd] = time.time()
-                    
-                    atraso = random.uniform(cfg.get("ATRASO_RESPOSTA_MIN", 2), cfg.get("ATRASO_RESPOSTA_MAX", 5))
-                    self.gui.log_message(f"   [Gatilho: {id_grupo}] Respondendo {usuario_display} em {atraso:.1f}s", "sistema")
-                    
-                    await asyncio.sleep(atraso)
-                    
-                    resp_escolhida = random.choice(respostas)
-                    await msg.reply(resp_escolhida.format(user=usuario_display))
-                    return
-
-        if texto_original.startswith('!'):
-            comando = partes[0][1:].lower()
-            if comando in cfg.get("COMANDOS_CUSTOM", {}):
-                c_data = cfg["COMANDOS_CUSTOM"][comando]
-                res = c_data["resposta"] if isinstance(
-                    c_data, dict) else c_data
-                cd_v = c_data.get("cooldown", 10)
-                if time.time() - self.last_command_usage.get(f"{canal}_{comando}", 0) < cd_v:
-                    return
-                await msg.reply(res)
-                self.last_command_usage[f"{canal}_{comando}"] = time.time()
-
-
-class BotGui(tk.Tk):
-    def __init__(self, asyncio_loop):
-        super().__init__()
-        self.asyncio_loop = asyncio_loop
-        self.title("Miiza Bot")
-        self.geometry("850x700")
-        self.configure(bg="#2d2d2d")
-        self.channels_var = tk.StringVar()
-        self.channels_var.trace_add("write", self.verificar_mudanca_canais)
-        self.create_widgets()
-        self.chat_handler = TwitchChatHandler(self)
-        self.protocol("WM_DELETE_WINDOW", self.on_closing)
-        cfg = carregar_config_inicial()
-        if cfg:
-            self.channels_entry.insert(0, cfg.get("CANAIS", ""))
-            if cfg.get("CANAIS"):
-                self.target_channel_entry.insert(
-                    0, cfg["CANAIS"].split(',')[0].strip())
-        self.after(100, self.run_asyncio_tasks)
-        try:
-            icon_path = resource_path("logo.ico")
-            self.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Erro ao carregar ícone: {e}")
-
-    def create_widgets(self):
-        top = tk.Frame(self, bg="#2d2d2d", pady=10)
-        top.pack(fill='x', padx=10)
-        self.channels_entry = tk.Entry(
-            top, bg="#3d3d3d", fg="white", insertbackground="white", textvariable=self.channels_var)
-        self.channels_entry.pack(side='left', fill='x', expand=True, padx=5)
-        self.connect_button = tk.Button(
-            top, text="CONECTAR", command=self.toggle_connection, bg="#4CAF50", fg="white", width=15)
-        self.connect_button.pack(side='right')
-        self.reboot_button = tk.Button(top, text="🔁", command=self.reiniciar_bot,
-                                       bg="#555555", fg="white", width=4, font=("Segoe UI Emoji", 8, "bold"))
-        self.reboot_button.pack(side='left', padx=2)
-
-        stats_f = tk.Frame(self, bg="#1e1e1e", pady=3)
-        stats_f.pack(fill='x', side='bottom')
-
-        self.lbl_bans = tk.Label(
-            stats_f, text="🔨 Bans: 0", bg="#1e1e1e", fg="#ff5555", font=("Arial", 9, "bold"))
-        self.lbl_bans.pack(side='left', padx=20)
-
-        self.lbl_timeouts = tk.Label(
-            stats_f, text="⏳ Timeouts: 0", bg="#1e1e1e", fg="#ffb86c", font=("Arial", 9, "bold"))
-        self.lbl_timeouts.pack(side='left', padx=20)
-
-        self.lbl_subs = tk.Label(
-            stats_f, text="💎 Subs: 0", bg="#1e1e1e", fg="#bd93f9", font=("Arial", 9, "bold"))
-        self.lbl_subs.pack(side='left', padx=20)
-
-        stats = tk.Frame(self, bg="#1e1e1e", pady=5)
-        stats.pack(fill='x', padx=10)
-        self.status_var = tk.StringVar(value="Status: Desconectado")
-        tk.Label(stats, textvariable=self.status_var, bg="#1e1e1e",
-                 fg="#00ff00").pack(side='left', padx=10)
-        self.counter_var = tk.StringVar(value="Mensagens: 0")
-        tk.Label(stats, textvariable=self.counter_var, bg="#1e1e1e",
-                 fg="#8be9fd").pack(side='right', padx=10)
-
-        self.log_area = scrolledtext.ScrolledText(
-            self, bg="#121212", fg="#e0e0e0", font=("Consolas", 10))
-        self.log_area.pack(fill='both', expand=True, padx=10, pady=5)
-        self.log_area.tag_config("hora", foreground="#888888")
-        self.log_area.tag_config(
-            "canal", foreground="#bd93f9", font=("Consolas", 10, "bold"))
-        self.log_area.tag_config(
-            "user", foreground="#ffb86c", font=("Consolas", 10, "bold"))
-        self.log_area.tag_config("sistema", foreground="#50fa7b")
-        self.log_area.tag_config("erro", foreground="#ff5555")
-        self.log_area.tag_config("moderacao", foreground="#ffb86c")
-        self.log_area.tag_config("proprio", foreground="#8be9fd")
-        self.log_area.tag_config(
-            "highlight", background="#f1fa8c", foreground="#282a36")
-        self.log_area.config(state='disabled')
-
-        mid_f = tk.Frame(self, bg="#2d2d2d", pady=5)
-        mid_f.pack(fill='x', padx=10)
-
-        tk.Button(mid_f, text="📂 LOGS", command=self.abrir_pasta_logs,
-                  bg="#444444", fg="white", font=("Arial", 9, "bold")).pack(side='left', padx=(0, 10))
-        tk.Button(mid_f, text="🧹 LIMPAR", command=self.limpar_tela_bot,
-                  bg="#444444", fg="white", font=("Arial", 9, "bold")).pack(side='left')
-        tk.Button(mid_f, text="⚙️ CONFIGS", command=self.abrir_janela_configs,
-                  bg="#6441a5", fg="white", font=("Arial", 9, "bold")).pack(side='left', padx=2)
-
-        bot_f = tk.Frame(self, bg="#2d2d2d", pady=10)
-        bot_f.pack(fill='x', padx=10)
-        self.target_channel_entry = tk.Entry(
-            bot_f, width=12, bg="#3d3d3d", fg="white")
-        self.target_channel_entry.pack(side='left')
-        self.message_entry = tk.Entry(
-            bot_f, bg="#3d3d3d", fg="white", insertbackground="white")
-        self.message_entry.pack(side='left', fill='x', expand=True, padx=5)
-        self.message_entry.bind(
-            '<Return>', lambda e: self.send_button_action())
-        tk.Button(bot_f, text="ENVIAR", command=self.send_button_action,
-                  bg="#2196F3", fg="white").pack(side='right')
-
-    def incrementar_estatistica(self, tipo):
-        if tipo == "bans":
-            valor = int(self.lbl_bans.cget("text").split(": ")[1]) + 1
-            self.lbl_bans.config(text=f"🔨 Bans: {valor}")
-        elif tipo == "timeouts":
-            valor = int(self.lbl_timeouts.cget("text").split(": ")[1]) + 1
-            self.lbl_timeouts.config(text=f"⏳ Timeouts: {valor}")
-        elif tipo == "subs":
-            valor = int(self.lbl_subs.cget("text").split(": ")[1]) + 1
-            self.lbl_subs.config(text=f"💎 Subs: {valor}")
-
-    def reiniciar_bot(self):
-        """Fecha a conexão atual e inicia uma nova imediatamente"""
-        if not messagebox.askyesno("Reiniciar", "Deseja reiniciar a conexão do bot agora?"):
-            return
-
-        self.log_message("♻️ Reiniciando sistemas do bot...", "sistema")
-
-        async def seq_reiniciar():
-            if self.chat_handler.is_connected:
-                await self.chat_handler.close()
-
-            await asyncio.sleep(1)
-
-            canais = self.channels_var.get().strip()
-            if canais:
-                await self.chat_handler.connect(canais.split(','))
-
-        asyncio.run_coroutine_threadsafe(seq_reiniciar(), self.asyncio_loop)
-
-    def verificar_mudanca_canais(self, *args):
-        """Muda o estado do botão dependendo do que foi digitado"""
-        if not hasattr(self, 'chat_handler') or not self.chat_handler.is_connected:
-            self.connect_button.config(text="CONECTAR", bg="#4CAF50")
-            return
-
-        canais_na_tela = self.channels_var.get().strip().lower()
-        canais_atuais = ",".join(
-            sorted(list(self.chat_handler.canais_conectados)))
-        canais_novos = ",".join(
-            sorted([c.strip().lower() for c in canais_na_tela.split(',') if c.strip()]))
-
-        if canais_novos != canais_atuais:
-            self.connect_button.config(text="ATUALIZAR", bg="#2196F3")
-        else:
-            self.connect_button.config(text="DESCONECTAR", bg="#f44336")
-
-    def abrir_pasta_logs(self):
-        """Abre a pasta onde os arquivos de log são salvos"""
-        if not os.path.exists(PASTA_LOGS):
-            os.makedirs(PASTA_LOGS)
-        os.startfile(os.path.abspath(PASTA_LOGS))
-
-    def limpar_tela_bot(self):
-        """Limpa apenas a visualização de texto na interface do programa"""
-        self.log_area.config(state='normal')
-        self.log_area.delete('1.0', tk.END)
-        self.log_area.config(state='disabled')
-        self.log_message("--- Tela limpa pelo usuário ---", "sistema")
-
-    def log_message(self, message, tipo="sistema"):
-        """Insere mensagens com ícones e cores padronizadas"""
-        icones = {
-            "sistema": "🟢 ",
-            "erro": "🔴 ",
-            "moderacao": "🛡️ ",
-            "evento": "✨ ",
-            "proprio": "📩 ",
-            "chat": "💬 "
+        # Verifica se é highlight (palavra de alerta)
+        is_highlight = any(p.lower() in texto.lower() for p in cfg.get("PALAVRAS_ALERTA", []))
+        
+        # Prepara pacote de dados para enviar à interface
+        chat_data = {
+            "text": texto,
+            "user": user,
+            "channel": canal,
+            "msg_id": msg.id,
+            "highlight": is_highlight
         }
+        self.signals.chat_message.emit(chat_data)
+        
+        async def reply_handler(resp_text):
+            await msg.reply(resp_text)
 
-        icone = icones.get(tipo, "")
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        # Processa comandos
+        await self.processar_texto_comando(texto, canal, user, msg.user.id, is_mod, reply_handler, ignorar_saudacoes=False)
 
-        self.log_area.config(state='normal')
-        self.log_area.insert(tk.END, f"[{timestamp}] ", "hora")
-        self.log_area.insert(tk.END, f"{icone}{message}\n", tipo)
-        self.log_area.see(tk.END)
-        self.log_area.config(state='disabled')
+# --- JANELA DE CONFIGURAÇÕES (UI) ---
+class ModernConfigDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configurações - MiizaBot")
+        self.resize(800, 600)
+        self.config = carregar_config()
+        if "SAUDACOES" not in self.config: self.config["SAUDACOES"] = {}
+        if "COMANDOS_CUSTOM" not in self.config: self.config["COMANDOS_CUSTOM"] = {}
+        self.init_ui()
 
-    def log_chat_colorido(self, hora, canal, usuario, texto, highlight=False):
-        self.log_area.config(state='normal')
-        self.log_area.insert(tk.END, f"[{hora}] ", "hora")
-        self.log_area.insert(tk.END, f"[#{canal}] ", "canal")
-        self.log_area.insert(tk.END, f"{usuario}: ", "user")
-        tag_t = "highlight" if highlight else None
-        self.log_area.insert(tk.END, f"{texto}\n", tag_t)
-        self.log_area.see(tk.END)
-        self.log_area.config(state='disabled')
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        self.setup_general_tab()
+        self.setup_commands_tab()
+        self.setup_greetings_tab()
+        
+        # Botões de Salvar/Cancelar
+        btn_box = QHBoxLayout()
+        btn_save = QPushButton("Salvar Tudo e Fechar")
+        btn_save.clicked.connect(self.salvar_tudo)
+        btn_cancel = QPushButton("Cancelar")
+        btn_cancel.clicked.connect(self.reject)
+        
+        # Estilos dos botões
+        btn_save.setStyleSheet("""QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 10px; border-radius: 4px; } QPushButton:hover { background-color: #45a049; } QPushButton:pressed { background-color: #3e8e41; }""")
+        btn_cancel.setStyleSheet("""QPushButton { background-color: #f44336; color: white; padding: 10px; border-radius: 4px; } QPushButton:hover { background-color: #d32f2f; } QPushButton:pressed { background-color: #b71c1c; }""")
+        
+        btn_box.addStretch()
+        btn_box.addWidget(btn_cancel)
+        btn_box.addWidget(btn_save)
+        layout.addLayout(btn_box)
 
-    def update_status(self, s): self.status_var.set(f"Status: {s}")
-    def update_counter(self, v): self.counter_var.set(f"Mensagens: {v}")
+    # Auxiliar para criar SpinBox com botões + e -
+    def criar_spinbox_customizado(self, min_val, max_val, suffix=""):
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        spin = QSpinBox()
+        spin.setRange(min_val, max_val)
+        spin.setSuffix(suffix)
+        spin.setAlignment(Qt.AlignCenter)
+        btn_minus = QPushButton("-")
+        btn_minus.setObjectName("BtnSmall") 
+        btn_minus.setFixedSize(30, 30)
+        btn_minus.setCursor(Qt.PointingHandCursor)
+        btn_minus.clicked.connect(lambda: spin.stepBy(-1))
+        btn_plus = QPushButton("+")
+        btn_plus.setObjectName("BtnSmall")
+        btn_plus.setFixedSize(30, 30)
+        btn_plus.setCursor(Qt.PointingHandCursor)
+        btn_plus.clicked.connect(lambda: spin.stepBy(1))
+        layout.addWidget(btn_minus)
+        layout.addWidget(spin)
+        layout.addWidget(btn_plus)
+        return container, spin
 
-    def toggle_connection(self):
-        if self.connect_button.cget("text") == "DESCONECTAR":
-            asyncio.run_coroutine_threadsafe(
-                self.chat_handler.close(), self.asyncio_loop)
-            self.connect_button.config(text="CONECTAR", bg="#4CAF50")
-            return
+    # Aba Geral (Credenciais e Delays)
+    def setup_general_tab(self):
+        tab_geral = QWidget()
+        form_layout = QFormLayout(tab_geral)
+        form_layout.setLabelAlignment(Qt.AlignRight)
+        self.input_bot_name = QLineEdit(self.config.get("NOME_DO_BOT", ""))
+        self.input_app_id = QLineEdit(self.config.get("APP_ID", ""))
+        self.input_app_secret = QLineEdit(self.config.get("APP_SECRET", ""))
+        self.input_app_secret.setEchoMode(QLineEdit.Password)
+        self.input_alertas = QLineEdit(", ".join(self.config.get("PALAVRAS_ALERTA", [])))
+        self.check_startup = QCheckBox("Iniciar com Windows")
+        self.check_startup.setChecked(self.config.get("INICIAR_COM_WINDOWS", False))
+        self.container_min, self.spin_min_delay = self.criar_spinbox_customizado(0, 60)
+        self.spin_min_delay.setValue(int(self.config.get("ATRASO_RESPOSTA_MIN", 2)))
+        self.container_max, self.spin_max_delay = self.criar_spinbox_customizado(1, 120)
+        self.spin_max_delay.setValue(int(self.config.get("ATRASO_RESPOSTA_MAX", 5)))
+        form_layout.addRow("Nome do Bot:", self.input_bot_name)
+        form_layout.addRow("Client ID:", self.input_app_id)
+        form_layout.addRow("Client Secret:", self.input_app_secret)
+        form_layout.addRow("Palavras Alerta:", self.input_alertas)
+        form_layout.addRow("Delay Mínimo (s):", self.container_min)
+        form_layout.addRow("Delay Máximo (s):", self.container_max)
+        form_layout.addRow(self.check_startup)
+        self.tabs.addTab(tab_geral, "Geral")
 
-        canais_input = self.channels_var.get().strip()
-        if self.chat_handler.is_connected:
-            asyncio.run_coroutine_threadsafe(
-                self.chat_handler.atualizar_canais_dinamico(canais_input), self.asyncio_loop)
-            self.verificar_mudanca_canais()
+    # Aba Comandos Customizados
+    def setup_commands_tab(self):
+        tab_cmds = QWidget()
+        main_layout = QHBoxLayout(tab_cmds)
+        
+        # Painel Esquerdo: Lista
+        left_frame = QFrame()
+        left_layout = QVBoxLayout(left_frame)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        lbl_list = QLabel("Lista de Comandos")
+        lbl_list.setStyleSheet("font-weight: bold; color: #50fa7b;")
+        self.list_cmds = QListWidget()
+        self.list_cmds.itemClicked.connect(self.carregar_comando_selecionado)
+        
+        btn_box = QHBoxLayout()
+        btn_add = QPushButton("+")
+        btn_add.clicked.connect(self.adicionar_comando)
+        btn_del = QPushButton("-")
+        btn_del.clicked.connect(self.remover_comando)
+        
+        # Estilos Add/Del
+        style_add = """QPushButton { background-color: #4CAF50; font-weight: bold; color: white; border-radius: 4px; } QPushButton:hover { background-color: #45a049; } QPushButton:pressed { background-color: #3e8e41; }"""
+        style_del = """QPushButton { background-color: #f44336; font-weight: bold; color: white; border-radius: 4px; } QPushButton:hover { background-color: #d32f2f; } QPushButton:pressed { background-color: #b71c1c; }"""
+        btn_add.setStyleSheet(style_add)
+        btn_del.setStyleSheet(style_del)
+        
+        btn_box.addWidget(btn_add)
+        btn_box.addWidget(btn_del)
+        left_layout.addWidget(lbl_list)
+        left_layout.addWidget(self.list_cmds)
+        left_layout.addLayout(btn_box)
+        
+        # Painel Direito: Edição
+        right_frame = QFrame()
+        right_frame.setStyleSheet("background-color: #252526; border-radius: 5px;")
+        right_layout = QVBoxLayout(right_frame)
+        self.lbl_cmd_editing = QLabel("Selecione um comando")
+        self.lbl_cmd_editing.setStyleSheet("font-weight: bold; color: #8be9fd;")
+        self.edit_cmd_response = QTextEdit()
+        self.edit_cmd_response.setPlaceholderText("Resposta do comando...")
+        self.edit_cmd_response.textChanged.connect(self.reset_cmd_save_button)
+        row_cd = QHBoxLayout()
+        self.container_cmd_cd, self.spin_cmd_cd = self.criar_spinbox_customizado(0, 99999, " seg")
+        self.spin_cmd_cd.valueChanged.connect(self.reset_cmd_save_button)
+        self.combo_cmd_type = QComboBox()
+        self.combo_cmd_type.addItems(["global", "user"])
+        self.combo_cmd_type.currentIndexChanged.connect(self.reset_cmd_save_button)
+        row_cd.addWidget(QLabel("Cooldown:"))
+        row_cd.addWidget(self.container_cmd_cd)
+        row_cd.addWidget(QLabel("Tipo:"))
+        row_cd.addWidget(self.combo_cmd_type)
+        self.btn_update_cmd = QPushButton("Gravar Alterações do Comando")
+        self.btn_update_cmd.setStyleSheet("""QPushButton { background-color: #6272a4; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #7080b5; } QPushButton:pressed { background-color: #536396; }""")
+        self.btn_update_cmd.clicked.connect(self.atualizar_comando_memoria)
+        right_layout.addWidget(self.lbl_cmd_editing)
+        right_layout.addWidget(QLabel("Resposta:"))
+        right_layout.addWidget(self.edit_cmd_response)
+        right_layout.addLayout(row_cd)
+        right_layout.addWidget(self.btn_update_cmd)
+        main_layout.addWidget(left_frame, 1)
+        main_layout.addWidget(right_frame, 2)
+        self.tabs.addTab(tab_cmds, "Comandos Custom")
+        self.refresh_command_list()
+
+    # Aba Saudações
+    def setup_greetings_tab(self):
+        tab_saudacoes = QWidget()
+        main_layout = QHBoxLayout(tab_saudacoes)
+        left_frame = QFrame()
+        left_layout = QVBoxLayout(left_frame)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        lbl_list = QLabel("Grupos de Saudações")
+        lbl_list.setStyleSheet("font-weight: bold; color: #bd93f9;")
+        self.list_groups = QListWidget()
+        self.list_groups.itemClicked.connect(self.carregar_grupo_selecionado)
+        btn_group_box = QHBoxLayout()
+        btn_add = QPushButton("+")
+        btn_add.clicked.connect(self.adicionar_grupo)
+        btn_del = QPushButton("-")
+        btn_del.clicked.connect(self.remover_grupo)
+        btn_add.setStyleSheet("""QPushButton { background-color: #4CAF50; font-weight: bold; color: white; border-radius: 4px; } QPushButton:hover { background-color: #45a049; } QPushButton:pressed { background-color: #3e8e41; }""")
+        btn_del.setStyleSheet("""QPushButton { background-color: #f44336; font-weight: bold; color: white; border-radius: 4px; } QPushButton:hover { background-color: #d32f2f; } QPushButton:pressed { background-color: #b71c1c; }""")
+        btn_group_box.addWidget(btn_add)
+        btn_group_box.addWidget(btn_del)
+        left_layout.addWidget(lbl_list)
+        left_layout.addWidget(self.list_groups)
+        left_layout.addLayout(btn_group_box)
+        right_frame = QFrame()
+        right_frame.setStyleSheet("background-color: #252526; border-radius: 5px;")
+        right_layout = QVBoxLayout(right_frame)
+        self.lbl_editing = QLabel("Selecione um grupo")
+        self.lbl_editing.setStyleSheet("font-weight: bold; color: #8be9fd;")
+        self.edit_gatilhos = QLineEdit()
+        self.edit_gatilhos.setPlaceholderText("Ex: oi, olá")
+        self.edit_gatilhos.textChanged.connect(self.reset_save_button)
+        self.container_cooldown, self.edit_cooldown = self.criar_spinbox_customizado(0, 999999, " seg")
+        self.edit_cooldown.valueChanged.connect(self.reset_save_button)
+        self.edit_respostas = QTextEdit()
+        self.edit_respostas.setPlaceholderText("Digite uma resposta por linha...")
+        self.edit_respostas.textChanged.connect(self.reset_save_button)
+        self.btn_update_group = QPushButton("Gravar Alterações do Grupo")
+        self.btn_update_group.setStyleSheet("""QPushButton { background-color: #6272a4; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #7080b5; } QPushButton:pressed { background-color: #536396; }""")
+        self.btn_update_group.clicked.connect(self.atualizar_grupo_memoria)
+        right_layout.addWidget(self.lbl_editing)
+        right_layout.addWidget(QLabel("Gatilhos:"))
+        right_layout.addWidget(self.edit_gatilhos)
+        right_layout.addWidget(QLabel("Cooldown Global:"))
+        right_layout.addWidget(self.container_cooldown)
+        right_layout.addWidget(QLabel("Respostas (Randomizadas):"))
+        right_layout.addWidget(self.edit_respostas)
+        right_layout.addWidget(self.btn_update_group)
+        main_layout.addWidget(left_frame, 1)
+        main_layout.addWidget(right_frame, 2)
+        self.tabs.addTab(tab_saudacoes, "Saudações")
+        self.refresh_group_list()
+
+    def refresh_command_list(self):
+        self.list_cmds.clear()
+        for canal, comandos in self.config.get("COMANDOS_CUSTOM", {}).items():
+            for cmd_key in comandos.keys():
+                self.list_cmds.addItem(f"[{canal}] {cmd_key}")
+
+    def carregar_comando_selecionado(self, item):
+        texto = item.text() 
+        if "]" not in texto: return
+        
+        partes = texto.split("] ")
+        canal = partes[0].replace("[", "")
+        cmd_key = partes[1].replace("!", "")
+        
+        self.current_editing_cmd = (canal, cmd_key)
+
+        data = self.config["COMANDOS_CUSTOM"].get(canal, {}).get(f"!{cmd_key}", {}) or self.config["COMANDOS_CUSTOM"].get(canal, {}).get(cmd_key, {})
+
+        self.block_cmd_signals(True)
+        self.lbl_cmd_editing.setText(f"Editando: {texto}")
+        
+        if isinstance(data, str):
+            self.edit_cmd_response.setPlainText(data)
+            self.spin_cmd_cd.setValue(10)
+            self.combo_cmd_type.setCurrentText("global")
         else:
-            canais_input = self.channels_entry.get()
-            cfg = carregar_config_inicial()
-            if cfg:
-                cfg["CANAIS"] = canais_input
-                salvar_config(cfg)
-                self.connect_button.config(text="DESCONECTAR", bg="#f44336")
-                asyncio.run_coroutine_threadsafe(self.chat_handler.connect(
-                    canais_input.split(',')), self.asyncio_loop)
-
-    def abrir_janela_configs(self):
-        """Cria uma janela com abas para Geral e Saudações"""
-        self.config_temp = carregar_config_inicial() 
-
-        self.janela_config = tk.Toplevel(self)
-        self.janela_config.title("Configurações do Bot")
-        self.janela_config.geometry("600x550")
-        self.janela_config.configure(bg="#2d2d2d")
-
-        frame_rodape = tk.Frame(self.janela_config, bg="#2d2d2d", pady=10)
-        frame_rodape.pack(side="bottom", fill="x")
+            self.edit_cmd_response.setPlainText(data.get("resposta", ""))
+            self.spin_cmd_cd.setValue(int(data.get("cooldown", 10)))
+            self.combo_cmd_type.setCurrentText(data.get("tipo", "global"))
         
-        notebook = ttk.Notebook(self.janela_config)
-        notebook.pack(side="top", fill="both", expand=True, padx=10, pady=10)
+        self.block_cmd_signals(False)
+        self.reset_cmd_save_button()
 
-        tab_geral = tk.Frame(notebook, bg="#2d2d2d")
-        notebook.add(tab_geral, text="Geral")
-
-        tk.Label(tab_geral, text="Palavras de Alerta (separe por vírgula):", bg="#2d2d2d", fg="white").pack(pady=5)
-        alertas_ent = tk.Entry(tab_geral, width=50)
-        alertas_ent.pack(padx=10)
-        alertas_ent.insert(0, ", ".join(self.config_temp.get("PALAVRAS_ALERTA", [])))
-
-        tk.Label(tab_geral, text="Delay Mínimo (seg):", bg="#2d2d2d", fg="white").pack(pady=5)
-        min_delay = tk.Scale(tab_geral, from_=0, to=10, orient='horizontal', bg="#2d2d2d", fg="white")
-        min_delay.set(self.config_temp.get("ATRASO_RESPOSTA_MIN", 2))
-        min_delay.pack()
-
-        tk.Label(tab_geral, text="Delay Máximo (seg):", bg="#2d2d2d", fg="white").pack(pady=5)
-        max_delay = tk.Scale(tab_geral, from_=1, to=30, orient='horizontal', bg="#2d2d2d", fg="white")
-        max_delay.set(self.config_temp.get("ATRASO_RESPOSTA_MAX", 5))
-        max_delay.pack()
-
-        var_startup = tk.BooleanVar(value=self.config_temp.get("INICIAR_COM_WINDOWS", False))
-        tk.Checkbutton(tab_geral, text="Iniciar junto com o Windows", variable=var_startup,
-                       bg="#2d2d2d", fg="white", selectcolor="#1e1e1e",
-                       activebackground="#2d2d2d", activeforeground="white").pack(pady=10)
-
-        self.tab_saudacoes = tk.Frame(notebook, bg="#e1e1e1")
-        notebook.add(self.tab_saudacoes, text="Saudações & Cooldown")
-
-        frame_lista = tk.LabelFrame(self.tab_saudacoes, text="Grupos")
-        frame_lista.pack(side="left", fill="y", padx=5, pady=5)
-
-        self.listbox_grupos = tk.Listbox(frame_lista, width=20, exportselection=False)
-        self.listbox_grupos.pack(fill="both", expand=True, padx=5, pady=5)
-        self.listbox_grupos.bind("<<ListboxSelect>>", self.carregar_grupo_selecionado)
-
-        frame_botoes_lista = tk.Frame(frame_lista)
-        frame_botoes_lista.pack(fill="x", padx=5, pady=5)
-        tk.Button(frame_botoes_lista, text="+", command=self.novo_grupo, width=3).pack(side="left", expand=True)
-        tk.Button(frame_botoes_lista, text="-", command=self.remover_grupo, width=3).pack(side="left", expand=True)
-
-        frame_edicao = tk.LabelFrame(self.tab_saudacoes, text="Editar Grupo")
-        frame_edicao.pack(side="right", fill="both", expand=True, padx=5, pady=5)
-
-        tk.Label(frame_edicao, text="Gatilhos (virgula):").pack(anchor="w", padx=5)
-        self.entry_gatilhos = tk.Entry(frame_edicao)
-        self.entry_gatilhos.pack(fill="x", padx=5)
-
-        tk.Label(frame_edicao, text="Cooldown (seg):").pack(anchor="w", padx=5, pady=(10,0))
-        self.spin_cooldown = tk.Spinbox(frame_edicao, from_=0, to=9999)
-        self.spin_cooldown.pack(anchor="w", padx=5)
-
-        tk.Label(frame_edicao, text="Respostas (uma por linha):").pack(anchor="w", padx=5, pady=(10,0))
-        self.txt_respostas = tk.Text(frame_edicao, height=8, width=30)
-        self.txt_respostas.pack(fill="both", expand=True, padx=5, pady=5)
-
-        tk.Button(frame_edicao, text="Gravar Alterações do Grupo", command=self.salvar_grupo_atual, bg="#dddddd").pack(fill="x", padx=5, pady=5)
-
-        self.atualizar_lista_grupos()
-
-        def salvar_tudo():
-            self.salvar_grupo_atual(silent=True)
-            
-            self.config_temp["PALAVRAS_ALERTA"] = [x.strip() for x in alertas_ent.get().split(',') if x.strip()]
-            self.config_temp["ATRASO_RESPOSTA_MIN"] = min_delay.get()
-            self.config_temp["ATRASO_RESPOSTA_MAX"] = max_delay.get()
-            self.config_temp["INICIAR_COM_WINDOWS"] = var_startup.get()
-            
-            configurar_inicializacao_windows(self.config_temp["INICIAR_COM_WINDOWS"])
-            salvar_config(self.config_temp)
-            
-            messagebox.showinfo("Sucesso", "Todas as configurações salvas!", parent=self.janela_config)
-            self.janela_config.destroy()
-
-        tk.Button(frame_rodape, text="SALVAR TUDO E FECHAR", command=salvar_tudo,
-                  bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), pady=10).pack(fill='x', padx=10)
-        
-    def atualizar_lista_grupos(self):
-        self.listbox_grupos.delete(0, tk.END)
-        saudacoes = self.config_temp.get("SAUDACOES", {})
-        for key in saudacoes.keys():
-            self.listbox_grupos.insert(tk.END, key)
-
-    def carregar_grupo_selecionado(self, event):
-        selecao = self.listbox_grupos.curselection()
-        if not selecao: return
-        
-        grupo_id = self.listbox_grupos.get(selecao[0])
-        dados = self.config_temp["SAUDACOES"].get(grupo_id, {})
-
-        gatilhos_list = dados.get("gatilhos", [])
-        self.entry_gatilhos.delete(0, tk.END)
-        self.entry_gatilhos.insert(0, ", ".join(gatilhos_list))
-
-        self.spin_cooldown.delete(0, tk.END)
-        self.spin_cooldown.insert(0, str(dados.get("cooldown", 30)))
-
-        respostas_list = dados.get("respostas", [])
-        self.txt_respostas.delete("1.0", tk.END)
-        self.txt_respostas.insert("1.0", "\n".join(respostas_list))
-
-    def salvar_grupo_atual(self, silent=False):
-        selecao = self.listbox_grupos.curselection()
-        
-        if not selecao:
-            if not silent:
-                messagebox.showwarning("Atenção", "Selecione um grupo na lista à esquerda antes de salvar!", parent=self.janela_config)
+    def atualizar_comando_memoria(self):
+        if not hasattr(self, 'current_editing_cmd') or not self.current_editing_cmd:
             return
-
-        grupo_id = self.listbox_grupos.get(selecao[0])
         
-        raw_gatilhos = self.entry_gatilhos.get()
-        lista_gatilhos = [g.strip() for g in raw_gatilhos.split(",") if g.strip()]
-        
-        raw_respostas = self.txt_respostas.get("1.0", tk.END).strip()
-        lista_respostas = [r for r in raw_respostas.split("\n") if r.strip()]
-        
-        try:
-            cd_val = int(self.spin_cooldown.get())
-        except:
-            cd_val = 30
+        canal, cmd_key = self.current_editing_cmd
+        full_key = "!" + cmd_key.replace("!", "")
 
-        if "SAUDACOES" not in self.config_temp:
-            self.config_temp["SAUDACOES"] = {}
-
-        self.config_temp["SAUDACOES"][grupo_id] = {
-            "gatilhos": lista_gatilhos,
-            "respostas": lista_respostas,
-            "cooldown": cd_val
+        novo_dado = {
+            "resposta": self.edit_cmd_response.toPlainText(),
+            "cooldown": self.spin_cmd_cd.value(),
+            "tipo": self.combo_cmd_type.currentText()
         }
         
-        if not silent:
-            messagebox.showinfo("Sucesso", f"Grupo '{grupo_id}' atualizado!\n(Clique em SALVAR TUDO para finalizar)", parent=self.janela_config)
+        if "COMANDOS_CUSTOM" not in self.config: self.config["COMANDOS_CUSTOM"] = {}
+        if canal not in self.config["COMANDOS_CUSTOM"]: self.config["COMANDOS_CUSTOM"][canal] = {}
+        
+        self.config["COMANDOS_CUSTOM"][canal][full_key] = novo_dado
+        
+        btn = self.sender()
+        btn.setText("Salvo!")
+        btn.setStyleSheet("background-color: #50fa7b; color: #282a36; font-weight: bold; border-radius: 4px;")
 
-    def novo_grupo(self):
-        novo = simpledialog.askstring("Novo", "Nome do ID do grupo (sem espaços):", parent=self.janela_config)
-        if novo:
-            if "SAUDACOES" not in self.config_temp: self.config_temp["SAUDACOES"] = {}
-            self.config_temp["SAUDACOES"][novo] = {
-                "gatilhos": ["gatilho"], "respostas": ["Olá!"], "cooldown": 30
+    def adicionar_comando(self):
+        canal, ok1 = QInputDialog.getText(self, 'Canal Alvo', 'Para qual canal? (ex: miiza)')
+        if not ok1 or not canal: return
+        
+        cmd_nome, ok2 = QInputDialog.getText(self, 'Novo Comando', 'Nome do comando (ex: !insta):')
+        if ok2 and cmd_nome:
+            canal = canal.lower().strip()
+            cmd_nome = cmd_nome.strip().lower()
+            if not cmd_nome.startswith('!'): cmd_nome = "!" + cmd_nome
+            
+            if "COMANDOS_CUSTOM" not in self.config: self.config["COMANDOS_CUSTOM"] = {}
+            if canal not in self.config["COMANDOS_CUSTOM"]: self.config["COMANDOS_CUSTOM"][canal] = {}
+            
+            self.config["COMANDOS_CUSTOM"][canal][cmd_nome] = {
+                "resposta": "Edite a resposta...", "cooldown": 10, "tipo": "global"
             }
-            self.atualizar_lista_grupos()
+            self.refresh_command_list()
+
+    def remover_comando(self):
+        curr = self.list_cmds.currentItem()
+        if curr and hasattr(self, 'current_editing_cmd'):
+            canal, cmd_key = self.current_editing_cmd
+            full_key = "!" + cmd_key.replace("!", "")
+            
+            if QMessageBox.question(self, "Excluir", f"Excluir {full_key} do canal {canal}?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes and (canal in self.config["COMANDOS_CUSTOM"] and full_key in self.config["COMANDOS_CUSTOM"][canal]):
+                del self.config["COMANDOS_CUSTOM"][canal][full_key]
+                self.refresh_command_list()
+                self.edit_cmd_response.clear()
+                self.lbl_cmd_editing.setText("Selecione um comando")
+
+    def reset_cmd_save_button(self):
+        self.btn_update_cmd.setText("Gravar Alterações do Comando")
+        self.btn_update_cmd.setStyleSheet("""QPushButton { background-color: #6272a4; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #7080b5; } QPushButton:pressed { background-color: #536396; }""")
+
+    def block_cmd_signals(self, block):
+        self.edit_cmd_response.blockSignals(block)
+        self.spin_cmd_cd.blockSignals(block)
+        self.combo_cmd_type.blockSignals(block)
+
+    def refresh_group_list(self):
+        self.list_groups.clear()
+        for key in self.config["SAUDACOES"].keys():
+            self.list_groups.addItem(key)
+
+    def carregar_grupo_selecionado(self, item):
+        group_id = item.text()
+        data = self.config["SAUDACOES"].get(group_id, {})
+        self.edit_gatilhos.blockSignals(True)
+        self.edit_cooldown.blockSignals(True)
+        self.edit_respostas.blockSignals(True)
+        self.lbl_editing.setText(f"Editando: {group_id}")
+        self.edit_gatilhos.setText(", ".join(data.get("gatilhos", [])))
+        self.edit_cooldown.setValue(int(data.get("cooldown", 30)))
+        self.edit_respostas.setPlainText("\n".join(data.get("respostas", [])))
+        self.edit_gatilhos.blockSignals(False)
+        self.edit_cooldown.blockSignals(False)
+        self.edit_respostas.blockSignals(False)
+        self.reset_save_button()
+
+    def atualizar_grupo_memoria(self):
+        curr_item = self.list_groups.currentItem()
+        if not curr_item: return
+        group_id = curr_item.text()
+        self.config["SAUDACOES"][group_id] = {
+            "gatilhos": [x.strip() for x in self.edit_gatilhos.text().split(',') if x.strip()],
+            "respostas": [x for x in self.edit_respostas.toPlainText().split('\n') if x.strip()],
+            "cooldown": self.edit_cooldown.value()
+        }
+        btn = self.sender()
+        btn.setText("Salvo!")
+        btn.setStyleSheet("background-color: #50fa7b; color: #282a36; font-weight: bold; border-radius: 4px;")
+
+    def reset_save_button(self):
+        self.btn_update_group.setText("Gravar Alterações do Grupo")
+        self.btn_update_group.setStyleSheet("""QPushButton { background-color: #6272a4; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #7080b5; } QPushButton:pressed { background-color: #536396; }""")
+
+    def adicionar_grupo(self):
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(self, 'Novo Grupo', 'Nome do ID do grupo:')
+        if ok and text:
+            text = text.strip().replace(" ", "_")
+            if text not in self.config["SAUDACOES"]:
+                self.config["SAUDACOES"][text] = {"gatilhos": [text], "respostas": ["Olá!"], "cooldown": 30}
+                self.refresh_group_list()
 
     def remover_grupo(self):
-        selecao = self.listbox_grupos.curselection()
-        if not selecao: return
-        grupo = self.listbox_grupos.get(selecao[0])
+        if curr := self.list_groups.currentItem():
+            group_id = curr.text()
+            if QMessageBox.question(self, "Confirmar", f"Excluir '{group_id}'?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
+                del self.config["SAUDACOES"][group_id]
+                self.refresh_group_list()
+                self.edit_gatilhos.clear()
+                self.edit_respostas.clear()
+
+    def salvar_tudo(self):
+        self.config["NOME_DO_BOT"] = self.input_bot_name.text()
+        self.config["APP_ID"] = self.input_app_id.text()
+        self.config["APP_SECRET"] = self.input_app_secret.text()
+        self.config["PALAVRAS_ALERTA"] = [x.strip() for x in self.input_alertas.text().split(",") if x.strip()]
+        self.config["INICIAR_COM_WINDOWS"] = self.check_startup.isChecked()
+        self.config["ATRASO_RESPOSTA_MIN"] = self.spin_min_delay.value()
+        self.config["ATRASO_RESPOSTA_MAX"] = self.spin_max_delay.value()
+        salvar_config(self.config)
+        configurar_inicializacao_windows(self.config["INICIAR_COM_WINDOWS"])
+        self.accept()
+
+# --- JANELA PRINCIPAL (MAIN WINDOW) ---
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MiizaBot Pro")
+        self.resize(900, 700)
+
+        # Inicializa lógica e sinais
+        self.signals = BotSignals()
+        self.bot_logic = TwitchBotLogic(self.signals)
+
+        # Conecta sinais às funções da interface
+        self.signals.log.connect(self.append_log)
+        self.signals.chat_message.connect(self.append_chat_message)
+        self.signals.status.connect(self.update_status)
+        self.signals.counter.connect(self.update_counter)
+        self.signals.stats_update.connect(self.update_stats)
+        self.signals.pop_alert.connect(lambda t, m: QMessageBox.warning(self, t, m))
+
+        self.setup_ui()
+        self.setup_style()
+
+        # Carrega configs iniciais na tela
+        cfg = carregar_config()
+        self.entry_canais.setText(cfg.get("CANAIS", ""))
+        self.input_channel_target.setText(cfg.get("CANAIS", "").split(',')[0].strip())
+
+    # Configuração da Interface (Widgets)
+    def setup_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+
+        # Barra Superior (Canais e Conectar)
+        top_frame = QFrame()
+        top_frame.setObjectName("Card")
+        top_layout = QHBoxLayout(top_frame)
+        self.entry_canais = QLineEdit()
+        self.entry_canais.setPlaceholderText("Canais para monitorar (ex: canal1, canal2)")
+        self.entry_canais.textChanged.connect(self.verificar_mudanca_canais)
+        self.btn_connect = QPushButton("CONECTAR")
+        self.btn_connect.setObjectName("BtnConnect")
+        self.btn_connect.setCursor(Qt.PointingHandCursor)
+        self.btn_connect.clicked.connect(self.toggle_connection)
+        self.btn_config = QPushButton("⚙️")
+        self.btn_config.setFixedSize(40, 30)
+        self.btn_config.clicked.connect(self.open_config)
+        top_layout.addWidget(QLabel("Canais:"))
+        top_layout.addWidget(self.entry_canais)
+        top_layout.addWidget(self.btn_connect)
+        top_layout.addWidget(self.btn_config)
+        main_layout.addWidget(top_frame)
+
+        # Estatísticas (Subs)
+        stats_layout = QHBoxLayout()
+        self.lbl_subs = self.create_stat_card("💎 Subs", "0", "#bd93f9")
+        stats_layout.addWidget(self.lbl_subs)
+        stats_layout.addStretch() 
+        main_layout.addLayout(stats_layout)
+
+        # Log Principal
+        self.log_viewer = LogBrowser()
+        self.log_viewer.setReadOnly(True)
+        self.log_viewer.setOpenLinks(False) # IMPORTANTE: Evita limpar tela ao clicar links
+        self.log_viewer.setOpenExternalLinks(False)
+        self.log_viewer.anchorClicked.connect(self.handle_link_click)
+        self.log_viewer.setObjectName("LogViewer")
+        main_layout.addWidget(self.log_viewer)
+
+        # Barra de Status
+        info_layout = QHBoxLayout()
+        self.lbl_status = QLabel("Status: OFFLINE")
+        self.lbl_status.setStyleSheet("color: #777; font-weight: bold;")
+        self.lbl_counter = QLabel("Msgs: 0")
+        self.lbl_counter.setStyleSheet("color: #777;")
+        info_layout.addWidget(self.lbl_status)
+        info_layout.addStretch()
+        info_layout.addWidget(self.lbl_counter)
+        main_layout.addLayout(info_layout)
+
+        # Barra de Ação (Enviar mensagem manual)
+        action_frame = QFrame()
+        action_frame.setObjectName("Card")
+        action_layout = QHBoxLayout(action_frame)
+        self.input_channel_target = QLineEdit()
+        self.input_channel_target.setPlaceholderText("Canal alvo")
+        self.input_channel_target.setFixedWidth(100)
+        self.input_message = QLineEdit()
+        self.input_message.setPlaceholderText("Enviar mensagem como bot...")
+        self.input_message.returnPressed.connect(self.send_message_action)
+        btn_send = QPushButton("ENVIAR")
+        btn_send.setObjectName("BtnAction")
+        btn_send.clicked.connect(self.send_message_action)
+        btn_logs = QPushButton("📂 Logs")
+        btn_logs.clicked.connect(lambda: os.startfile(os.path.abspath(PASTA_LOGS)))
+        action_layout.addWidget(btn_logs)
+        action_layout.addWidget(self.input_channel_target)
+        action_layout.addWidget(self.input_message)
+        action_layout.addWidget(btn_send)
+        main_layout.addWidget(action_frame)
+
+    # Cria cartões visuais para stats
+    def create_stat_card(self, title, value, color):
+        frame = QFrame()
+        frame.setObjectName("StatCard")
+        frame.setStyleSheet(f"QFrame#StatCard {{ background-color: #252526; border-left: 5px solid {color}; border-radius: 5px; }}")
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(15, 8, 15, 8)
+        lbl_title = QLabel(title)
+        lbl_title.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 11pt;")
+        lbl_val = QLabel(value)
+        lbl_val.setObjectName("Value")
+        lbl_val.setStyleSheet("color: white; font-weight: bold; font-size: 12pt;")
+        layout.addWidget(lbl_title)
+        layout.addWidget(lbl_val)
+        layout.addStretch() 
+        return frame
+
+    # Configuração do CSS (Estilo)
+    def setup_style(self):
+        qss = """
+        QMainWindow { background-color: #1e1e1e; }
+        QWidget { color: #e0e0e0; font-family: 'Segoe UI', Arial; font-size: 10pt; }
+        QFrame#Card { background-color: #2d2d2d; border-radius: 8px; border: 1px solid #3d3d3d; }
+        QFrame#StatCard { background-color: #252526; border-radius: 5px; border: 1px solid #3d3d3d; border-left-width: 5px; }
+        QLineEdit, QTextEdit, QComboBox { background-color: #3c3c3c; border: 1px solid #555; border-radius: 4px; padding: 5px; color: white; }
+        QComboBox::drop-down { border: none; }
+        QSpinBox { background-color: #3c3c3c; border: 1px solid #555; border-radius: 4px; padding: 5px; color: white; }
+        QPushButton { background-color: #444; border: none; padding: 6px 12px; border-radius: 4px; }
+        QPushButton:hover { background-color: #555; }
+        QPushButton:pressed { background-color: #333; }
+        QPushButton#BtnSmall { background-color: #444; border: 1px solid #555; font-weight: bold; }
+        QPushButton#BtnConnect { background-color: #4CAF50; color: white; font-weight: bold; }
+        QPushButton#BtnAction { background-color: #2196F3; color: white; font-weight: bold; }
+        QPushButton#BtnAction:hover { background-color: #42A5F5; }
+        QTextBrowser#LogViewer { background-color: #121212; border: 1px solid #333; font-family: 'Consolas', monospace; }
+        """
+        self.setStyleSheet(qss)
+
+    def verificar_mudanca_canais(self):
+        if not self.bot_logic.is_connected:
+            self.btn_connect.setText("CONECTAR")
+            self.btn_connect.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; } QPushButton:hover { background-color: #45a049; }")
+            return
+        texto_input = self.entry_canais.text().lower()
+        set_input = {c.strip() for c in texto_input.split(',') if c.strip()}
+        set_conectados = self.bot_logic.canais_conectados
+        if set_input != set_conectados:
+            self.btn_connect.setText("ATUALIZAR CANAIS")
+            self.btn_connect.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; } QPushButton:hover { background-color: #0b7dda; }")
+        else:
+            self.btn_connect.setText("DESCONECTAR")
+            self.btn_connect.setStyleSheet("QPushButton { background-color: #f44336; color: white; font-weight: bold; } QPushButton:hover { background-color: #d32f2f; }")
+
+    @Slot()
+    def toggle_connection(self):
+        texto_botao = self.btn_connect.text()
+        canais_str = self.entry_canais.text()
+        if texto_botao == "ATUALIZAR CANAIS":
+            asyncio.ensure_future(self.bot_logic.atualizar_canais_dinamico(canais_str))
+            self.btn_connect.setText("DESCONECTAR")
+            self.btn_connect.setStyleSheet("background-color: #f44336; color: white; font-weight: bold;")
+            return
+        if not self.bot_logic.is_connected:
+            if not canais_str:
+                QMessageBox.warning(self, "Aviso", "Digite pelo menos um canal.")
+                return
+            cfg = carregar_config()
+            cfg["CANAIS"] = canais_str
+            salvar_config(cfg)
+            self.btn_connect.setText("CONECTANDO...")
+            self.btn_connect.setEnabled(False)
+            asyncio.ensure_future(self.bot_logic.connect(canais_str.split(',')))
+        else:
+            asyncio.ensure_future(self.bot_logic.close())
+
+    @Slot()
+    def send_message_action(self):
+        msg = self.input_message.text()
+        canal = self.input_channel_target.text()
+        if msg and canal:
+            asyncio.ensure_future(self.bot_logic.send_message(msg, canal))
+            self.input_message.clear()
+
+    @Slot()
+    def open_config(self):
+        dialog = ModernConfigDialog(self)
+        dialog.exec()
+
+    # Gera cores consistentes para nomes de usuários (Hash)
+    def get_consistent_color(self, string):
+        if not string: return "#ffffff"
+        colors = [
+            "#FFB6C1", "#87CEFA", "#98FB98", "#DDA0DD", "#F0E68C", 
+            "#FF7F50", "#00FFFF", "#ADFF2F", "#FF69B4", "#7B68EE",
+            "#40E0D0", "#FFA07A", "#BA55D3", "#66CDAA", "#FFD700"
+        ]
+        hash_val = sum(ord(c) for c in string) 
+        return colors[hash_val % len(colors)]
+
+    # Trata cliques nos botões de moderação do chat (Ban, Timeout, Delete)
+    @Slot(QUrl)
+    def handle_link_click(self, url):
+        link = url.toString()
+        if ":" not in link: return
+        parts = link.split(":")
+        action = parts[0]
+        target = parts[1]
+        channel = parts[2]
+
+        if action == "ban":
+            resp = QMessageBox.question(self, "Confirmar Ban", f"Tem certeza que deseja BANIR {target} em #{channel}?", QMessageBox.Yes | QMessageBox.No)
+            if resp == QMessageBox.Yes:
+                asyncio.ensure_future(self.bot_logic.ban_user(channel, target))
+        elif action == "delete":
+            asyncio.ensure_future(self.bot_logic.delete_message(channel, target))
+        elif action == "timeout":
+            duracao, ok = QInputDialog.getInt(self, "Timeout", f"Tempo de Timeout para {target} (segundos):", 600, 1)
+            if ok:
+                asyncio.ensure_future(self.bot_logic.timeout_user(channel, target, duracao))
         
-        if messagebox.askyesno("Confirmar", f"Excluir '{grupo}'?", parent=self.janela_config):
-            del self.config_temp["SAUDACOES"][grupo]
-            self.atualizar_lista_grupos()
-            self.entry_gatilhos.delete(0, tk.END)
-            self.txt_respostas.delete("1.0", tk.END)
+    # Formata e exibe mensagens de chat com botões e cores
+    @Slot(dict)
+    def append_chat_message(self, data):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        user = data['user']
+        channel = data['channel']
+        text = data['text']
+        msg_id = data['msg_id']
+        is_high = data['highlight']
+        chan_color = self.get_consistent_color(channel)
+        user_color = self.get_consistent_color(user)
 
-    def send_button_action(self):
-        m = self.message_entry.get()
-        t = self.target_channel_entry.get().strip().lower()
-        if m and t:
-            asyncio.run_coroutine_threadsafe(
-                self.chat_handler.send_message(m, t), self.asyncio_loop)
-            self.message_entry.delete(0, tk.END)
+        # Botões de ação (links falsos que acionam handle_link_click)
+        btn_to = f'<a href="timeout:{user}:{channel}" style="text-decoration:none; color:#FFB86C;">[⏳]</a>'
+        btn_ban = f'<a href="ban:{user}:{channel}" style="text-decoration:none; color:#FF5555;">[🚫]</a>'
+        btn_del = f'<a href="delete:{msg_id}:{channel}" style="text-decoration:none; color:#6272a4;">[🗑️]</a>'
+        
+        html_msg = (
+            f'<span style="color:#6272a4">[{timestamp}]</span> '
+            f'<span style="color:{chan_color}; font-weight:bold;">[#{channel}]</span> '
+            f'{btn_to} {btn_ban} {btn_del} '
+            f'<span style="color:{user_color}; font-weight:bold;">{user}</span>: '
+            f'<span style="color:#e0e0e0;">{text}</span>'
+        )
 
-    def run_asyncio_tasks(self):
+        if is_high:
+            html_msg = html_msg.replace('style="color:#e0e0e0;"', 'style="background-color: #44475a; color: #f1fa8c; font-weight:bold;"')
+
+        self.log_viewer.append(html_msg)
+        self.save_to_file(f"[#{channel}] {user}: {text}", "CHAT", channel)
+
+    # Log de sistema
+    @Slot(str, str, str)
+    def append_log(self, message, type_log, channel):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        colors = {"sistema": "#50fa7b", "erro": "#ff5555", "moderacao": "#ffb86c", "evento": "#bd93f9"}
+        color = colors.get(type_log, "#ffffff")
+        html = f'<span style="color:#6272a4">[{timestamp}]</span> <span style="color:{color}">{message}</span>'
+        self.log_viewer.append(html)
+        self.save_to_file(message, type_log, channel)
+
+    # Salva logs em arquivos organizados por data e canal
+    def save_to_file(self, message, type_log, channel):
         try:
-            self.asyncio_loop.stop()
-            self.asyncio_loop.run_forever()
-        except:
-            pass
-        self.after(10, self.run_asyncio_tasks)
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+            clean_msg = message.replace("\n", " ")
+            date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+            daily_folder = os.path.join(PASTA_LOGS, date_str)
+            if not os.path.exists(daily_folder): os.makedirs(daily_folder)
+            filename = f"{channel.strip()}.txt" if channel and channel.strip() else "Geral_Sistema.txt"
+            path = os.path.join(daily_folder, filename)
+            with open(path, 'a', encoding='utf-8') as f:
+                f.write(f"[{timestamp}] [{type_log.upper()}] {clean_msg}\n")
+        except Exception as e:
+            print(f"Erro ao logar: {e}")
 
-    def on_closing(self):
-        if messagebox.askokcancel("Sair", "Deseja realmente fechar o MiizaBot?"):
-            try:
-                if hasattr(self, 'chat_handler') and self.chat_handler.is_connected:
-                    asyncio.run_coroutine_threadsafe(
-                        self.chat_handler.close(), self.asyncio_loop)
+    @Slot(str)
+    def update_status(self, status):
+        color_status = "#777"
+        if status == "ONLINE":
+            color_status = "#50fa7b"
+            self.lbl_status.setText("Status: ONLINE")
+            self.btn_connect.setEnabled(True)
+            self.verificar_mudanca_canais() 
+        elif status == "RECONECTANDO...":
+            color_status = "#ffb86c"
+            self.lbl_status.setText(f"Status: {status}")
+            self.btn_connect.setText("AGUARDE...")
+            self.btn_connect.setEnabled(False)
+            self.btn_connect.setStyleSheet("QPushButton { background-color: #ffb86c; color: #282a36; font-weight: bold; }")
+        elif status in ["OFFLINE", "ERRO"]:
+            color_status = "#ff5555" if status == "ERRO" else "#777"
+            self.lbl_status.setText(f"Status: {status}")
+            self.btn_connect.setText("CONECTAR")
+            self.btn_connect.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; } QPushButton:hover { background-color: #45a049; }")
+            self.btn_connect.setEnabled(True)
+        self.lbl_status.setStyleSheet(f"color: {color_status}; font-weight: bold;")
 
-                self.after(500, self.destruir_processo)
-            except:
-                self.destruir_processo()
+    @Slot(int)
+    def update_counter(self, val):
+        self.lbl_counter.setText(f"Msgs: {val}")
 
-    def destruir_processo(self):
-        self.destroy()
-        os._exit(0)
+    @Slot(str, int)
+    def update_stats(self, tipo, val):
+        if tipo == 'subs':
+            lbl = self.lbl_subs.layout().itemAt(1).widget()
+            lbl.setText(str(val))
+
+    def closeEvent(self, event):
+        if self.bot_logic.is_connected:
+            asyncio.ensure_future(self.bot_logic.close())
+        event.accept()
 
 if __name__ == "__main__":
-    myappid = 'miiza.bot.twitch.v8.35'
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
-    if assistente_configuracao():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        app = BotGui(loop)
-        app.mainloop()
+    # Configuração de DPI para telas de alta resolução
+    os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
+    
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion") # Estilo moderno padrão do Qt
+    
+    # Integração do Loop Asyncio com Qt
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
+    
+    window = MainWindow()
+    window.show()
+    
+    # Inicia o loop de eventos
+    with loop:
+        loop.run_forever()

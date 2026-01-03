@@ -1,11 +1,9 @@
-.vscode/
-logs/
 __pycache__/
-bot-bckp.py
+.vscode/
+build/
+dist/
+ignore/
+logs/
 config.json
-icon.py
-logo.ico
-robo.png
 *.spec
 *.exe
-build/
