@@ -1059,7 +1059,7 @@ class ModernConfigDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MiizaBot Pro")
+        self.setWindowTitle("MiizaBot")
         self.resize(900, 700)
 
         # Inicializa lógica e sinais
@@ -1081,6 +1081,12 @@ class MainWindow(QMainWindow):
         cfg = carregar_config()
         self.entry_canais.setText(cfg.get("CANAIS", ""))
         self.input_channel_target.setText(cfg.get("CANAIS", "").split(',')[0].strip())
+        
+        # --- AUTO-CONNECT ---
+        # Se houver canais e credenciais salvas, inicia a conexão automaticamente
+        if cfg.get("CANAIS") and cfg.get("APP_ID") and cfg.get("APP_SECRET"):
+            self.signals.log.emit("🔄 Auto-conexão iniciada...", "sistema", "")
+            self.toggle_connection()
 
     # Configuração da Interface (Widgets)
     def setup_ui(self):

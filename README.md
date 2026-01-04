@@ -87,8 +87,8 @@ Se você deseja criar um executável para rodar em computadores sem Python insta
 | `!timeout <user> <seg> <motivo>` | Mod/Streamer | Aplica silêncio temporário. | `!timeout @user 600 Calma` |
 | `!unban <user>` | Mod/Streamer | Remove o banimento. | `!unban @user` |
 | `!limpar` | Mod/Streamer | Apaga o histórico recente do chat. | `!limpar` |
-| `!addcmd` | Mod/Streamer | Cria um comando customizado. | `!addcmd <nome> <cooldown> <global/user> <resposta>` |
-| `!delcmd` | Mod/Streamer | Apaga um comando customizado. | `!delcmd !discord` |
+| `!addcmd <nome> <cooldown> <global/user> <resposta>` | Mod/Streamer | Cria um comando customizado. | `!addcmd discord global discord.gg/miizaa` |
+| `!delcmd <comando>` | Mod/Streamer | Apaga um comando customizado. | `!delcmd !discord` |
 
 
 ---
